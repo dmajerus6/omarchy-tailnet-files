@@ -154,8 +154,38 @@ def error_text(stderr_lines, fallback):
     return useful[-1] if useful else (stderr_lines[-1] if stderr_lines else fallback)
 
 
+CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+SFTP_SPECIAL = set(" \t\"'\\#*?[")
+
+
+def check_path(path):
+    """Refuse paths no SSH tool can carry literally (a newline would start a
+    new sftp batch command)."""
+    if CONTROL_RE.search(path):
+        fail("%r contains a control character, so it can't be handled safely" % path)
+    return path
+
+
 def sftp_quote(path):
-    return '"' + path.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    """One literal sftp batch operand, escaped the way sftp(1) documents:
+    a backslash before whitespace, quotes, '#', backslash and the glob(3)
+    characters. Unquoted, sftp reads this back as exactly `path` both for
+    commands that glob their operand (rm, ls) and for those that don't
+    (cd, mkdir, rename, rmdir). Quoting instead would rely on an
+    undocumented special case."""
+    check_path(path)
+    if not path:
+        fail("Empty path")
+    if path.startswith("-"):
+        path = "./" + path  # never read as an option
+    return "".join("\\" + c if c in SFTP_SPECIAL else c for c in path)
+
+
+def glob_escape(path):
+    """Remote source paths for scp (SFTP mode) and rsync are glob patterns
+    on the far side; escape them so they match only the file named."""
+    check_path(path)
+    return re.sub(r"([\\*?\[])", r"\\\1", path)
 
 
 def run_sftp(host, commands, timeout=60):
@@ -170,11 +200,14 @@ def run_sftp(host, commands, timeout=60):
     return proc.returncode, proc.stdout, clean_stderr(proc.stderr)
 
 
-def run_ssh(host, remote_cmd, timeout=30):
+def run_ssh(host, remote_cmd, timeout=30, input_data=None):
+    """remote_cmd goes through the remote login shell, so it must be a
+    fixed string; pass anything user-controlled as input_data on stdin."""
     cmd = ["ssh"] + ssh_opts(host) + [host, remote_cmd]
+    stdin = {"input": input_data} if input_data is not None else {"stdin": subprocess.DEVNULL}
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                              env=ENV, stdin=subprocess.DEVNULL)
+                              env=ENV, **stdin)
     except subprocess.TimeoutExpired:
         return 124, "", ["Timed out talking to " + host]
     return proc.returncode, proc.stdout, clean_stderr(proc.stderr)
@@ -343,6 +376,9 @@ def remote_spec(target, path):
     return path if target == "local" else target + ":" + path
 
 
+RSYNC_WILDCARDS = re.compile(r"[*?\[\]\\]")
+
+
 def stream(cmd, parse, use_pty):
     """Run a transfer, emitting progress events. Returns (rc, stderr_lines)."""
     global child
@@ -430,6 +466,18 @@ def cmd_copy(args):
         use_rsync = use_rsync and info.get("posix") and info.get("rsync")
     if len(remote) == 2 or os.environ.get("TAILFILES_ENGINE") == "scp":
         use_rsync = False  # rsync cannot copy between two remotes; scp -3 relays through here.
+    # rsync passes remote paths through the remote shell with wildcards left
+    # unescaped, and the far end (a shell or rsync's own glob, depending on
+    # the implementation) expands them. No one escaping is right for every
+    # rsync, so such names go through scp, whose SFTP mode we escape exactly.
+    remote_paths = (paths if src != "local" else []) + ([dst_dir] if dst != "local" else [])
+    if any(RSYNC_WILDCARDS.search(p) for p in remote_paths):
+        use_rsync = False
+    for p in paths + [dst_dir]:
+        if CONTROL_RE.search(p):
+            out({"event": "done", "ok": False, "kind": "other",
+                 "error": "%r contains a control character, so it can't be copied safely" % p})
+            return 1
 
     out({"event": "start", "engine": "rsync" if use_rsync else "scp", "count": len(paths)})
     if use_rsync:
@@ -450,7 +498,9 @@ def cmd_copy(args):
                 return (u + "@" if u else "") + t + ":" + p
         else:
             spec = remote_spec
-        cmd += ["--"] + [spec(src, p) for p in paths] + [spec(dst, dst_dir)]
+        # Sources are globbed by scp's SFTP mode; the destination is not.
+        sources = [spec(src, p if src == "local" else glob_escape(p)) for p in paths]
+        cmd += ["--"] + sources + [spec(dst, dst_dir)]
         rc, err = stream(cmd, parse_scp, use_pty=True)
 
     if rc == 0:
@@ -462,9 +512,17 @@ def cmd_copy(args):
 
 # ---------------------------------------------------------------- file ops
 
-def guard_delete(path):
+def guard_delete(path, home=None):
+    """Refuse anything that isn't a plain absolute path strictly below a
+    root, a drive or the home folder of the machine it is on."""
+    check_path(path)
     norm = path.rstrip("/") or "/"
-    if norm in ("/", HOME, "~") or re.match(r"^/?[A-Za-z]:/?$", norm) or norm.count("/") < 1:
+    parts = norm.split("/")
+    homes = {h.rstrip("/") for h in (HOME, home) if h}
+    if (not norm.startswith("/") and not re.match(r"^[A-Za-z]:/", norm)) \
+            or any(p in (".", "..") for p in parts) \
+            or norm in ("/", "~") or norm in homes \
+            or re.match(r"^/?[A-Za-z]:/?$", norm):
         fail("Refusing to delete " + path)
 
 
@@ -496,7 +554,25 @@ def cmd_rename(target, old, new):
     out({"ok": True})
 
 
-def sftp_walk_delete(host, path, cmds):
+def remote_is_link(host, path):
+    """True when `path` itself is a symlink (judged from its parent's listing,
+    since `cd` would follow it)."""
+    parent, _, name = path.rstrip("/").rpartition("/")
+    rc, stdout, err = run_sftp(host, ["cd " + sftp_quote(parent or "/"), "ls -lan"])
+    if rc != 0:
+        fail(error_text(err, "Could not inspect " + path), classify(err))
+    for e in sftp_entries(stdout)[1]:
+        if e["name"] == name:
+            return e["type"] == "link"
+    fail("%s no longer exists" % path, "notfound")
+
+
+def sftp_walk_delete(host, path, cmds, top=True):
+    """Queue sftp commands deleting `path`. Nothing runs until every command
+    is built, so an unrepresentable name anywhere aborts the whole delete."""
+    if top and remote_is_link(host, path):
+        cmds.append("rm " + sftp_quote(path))  # the link only, never its target
+        return
     rc, stdout, err = run_sftp(host, ["cd " + sftp_quote(path), "pwd", "ls -lan"])
     if rc != 0:
         cmds.append("rm " + sftp_quote(path))
@@ -505,16 +581,18 @@ def sftp_walk_delete(host, path, cmds):
     for e in entries:
         child_path = join_remote(path, e["name"])
         if e["type"] == "dir":
-            sftp_walk_delete(host, child_path, cmds)
+            sftp_walk_delete(host, child_path, cmds, top=False)
         else:
             cmds.append("rm " + sftp_quote(child_path))
     cmds.append("rmdir " + sftp_quote(path))
 
 
 def cmd_delete(target, paths):
-    for p in paths:
-        guard_delete(p)
+    # No trailing slash: `rm -rf link/` would act on the link's target.
+    paths = [p.rstrip("/") or "/" for p in paths]
     if target == "local":
+        for p in paths:
+            guard_delete(p)
         trash = shutil.which("gio")
         for p in paths:
             if trash and subprocess.run([trash, "trash", "--", p], capture_output=True).returncode == 0:
@@ -532,8 +610,13 @@ def cmd_delete(target, paths):
     info = probe(host)
     if not info.get("ok"):
         fail(info.get("error", "Could not connect"), info.get("kind", "other"))
+    for p in paths:
+        guard_delete(p, info.get("home"))
     if info.get("posix"):
-        rc, _, err = run_ssh(host, "rm -rf -- " + " ".join(shlex.quote(p) for p in paths), timeout=300)
+        # The command is fixed; the paths travel NUL-separated on stdin, so
+        # no shell (whatever the login shell is) ever parses or globs them.
+        rc, _, err = run_ssh(host, "xargs -0 rm -rf --", timeout=300,
+                             input_data="".join(p + "\0" for p in paths))
         if rc != 0:
             fail(error_text(err, "Delete failed"), classify(err))
     else:
@@ -552,7 +635,7 @@ def cmd_open(target, path):
         dest_dir = os.path.join(CACHE_DIR, "open", host)
         os.makedirs(dest_dir, exist_ok=True)
         dest = os.path.join(dest_dir, os.path.basename(path.rstrip("/")) or "file")
-        cmd = ["scp", "-p", "-r"] + ssh_opts(host) + ["--", host + ":" + path, dest]
+        cmd = ["scp", "-p", "-r"] + ssh_opts(host) + ["--", host + ":" + glob_escape(path), dest]
         proc = subprocess.run(cmd, capture_output=True, text=True, env=ENV, stdin=subprocess.DEVNULL, timeout=600)
         if proc.returncode != 0:
             err = clean_stderr(proc.stderr)

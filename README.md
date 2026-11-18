@@ -136,9 +136,19 @@ setting is saved in `~/.config/tailfiles/hosts.json`. Settings in
   interrupted copy picks up where it stopped. Otherwise they use `scp -r -p`.
   Copies between two remote machines use `scp -3`, which routes the data
   through this computer.
+- Paths are always handled literally, even names with `*`, `?`, `[`, quotes
+  or spaces. SFTP commands escape every special character the way sftp(1)
+  documents, and scp source paths are escaped so they can't glob. rsync
+  leaves wildcards for the far end to expand, so a copy that involves such a
+  remote name goes through scp instead. Names containing control characters
+  are refused.
 - Deleting on this computer moves things to the Trash (`gio trash`). Deleting
   on another machine is permanent. The helper refuses to delete `/`, a drive
-  root, or your home folder.
+  root, either machine's home folder, or any path with `.` or `..` in it. On
+  Linux and macOS the paths go to `xargs -0 rm -rf --` on standard input, so
+  no remote shell parses them. On Windows it walks the folder over SFTP,
+  removes a selected symlink without following it, and builds every command
+  before running any of them.
 
 ## Files
 
