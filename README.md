@@ -8,6 +8,8 @@ inside your tailnet.
 
 Plugin id: `dmaje.tailfiles`
 
+![Tailnet Files: this computer on the left, a Mac on the right](preview.png)
+
 ## Install
 
 ```bash
