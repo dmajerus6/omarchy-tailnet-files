@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "dmaje.tailfiles",
+  "name": "Tailnet Files",
+  "version": "0.1.0",
+  "author": "dmaje",
+  "license": "MIT",
+  "description": "Two-pane file browser for the machines on your tailnet. Browse any machine over SFTP and copy files or folders between them with rsync or scp.",
+  "kinds": [
+    "bar-widget",
+    "panel"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "barWidget": "BarWidget.qml",
+    "panel": "App.qml"
+  },
+  "barWidget": {
+    "displayName": "Tailnet Files",
+    "description": "Opens a two-pane file browser between this computer and your tailnet machines.",
+    "category": "Network",
+    "aliases": ["tailscale", "sftp", "ssh", "scp", "rsync", "files", "transfer", "file manager"],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

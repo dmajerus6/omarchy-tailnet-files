@@ -1,0 +1,753 @@
+#!/usr/bin/python3 -I
+"""tailfiles — backend for the Tailnet Files Omarchy plugin.
+
+Browses and moves files between this machine and the machines on your
+tailnet over SSH: listings go through SFTP (works against Linux, macOS and
+Windows OpenSSH alike), transfers through rsync when both ends have it and
+scp otherwise. Every command prints JSON on stdout so the QML side never has
+to parse human output.
+
+  tailfiles peers
+  tailfiles probe HOST
+  tailfiles ls TARGET [PATH]
+  tailfiles copy SRC_TARGET DST_TARGET DST_DIR PATH...   (streams JSON lines)
+  tailfiles mkdir TARGET PATH
+  tailfiles rename TARGET OLD NEW
+  tailfiles delete TARGET PATH...
+  tailfiles open TARGET PATH
+  tailfiles config
+  tailfiles set-user HOST [USER]
+  tailfiles setup-key HOST
+
+TARGET is "local" for this computer or an SSH host name from `peers`.
+"""
+
+import base64
+import fcntl
+import json
+import os
+import pty
+import re
+import select
+import shlex
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import termios
+import time
+
+HOME = os.path.expanduser("~")
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "tailfiles")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "hosts.json")
+CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache"), "tailfiles")
+# Sockets and probe caches. Never a shared temp directory: without a
+# per-user runtime dir, fall back to the private cache dir.
+RUNTIME = (os.path.join(os.environ["XDG_RUNTIME_DIR"], "tailfiles")
+           if os.environ.get("XDG_RUNTIME_DIR") else os.path.join(CACHE_DIR, "run"))
+POSIX_SYSTEMS = {"Linux", "Darwin", "FreeBSD", "OpenBSD", "NetBSD", "DragonFly", "SunOS"}
+HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
+USER_RE = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._@\\-]*$")
+ENV = dict(os.environ, LC_ALL="C", LANG="C")
+
+
+def out(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def fail(message, kind="other", **extra):
+    out(dict({"ok": False, "error": message, "kind": kind}, **extra))
+    sys.exit(1)
+
+
+# ------------------------------------------------------------------ config
+
+def load_config():
+    try:
+        with open(CONFIG_FILE) as fh:
+            data = json.load(fh)
+        if isinstance(data, dict) and isinstance(data.get("hosts"), dict):
+            return data
+    except (OSError, ValueError):
+        pass
+    return {"hosts": {}}
+
+
+def save_config(data):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = CONFIG_FILE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(data, fh, indent=2)
+        fh.write("\n")
+    os.replace(tmp, CONFIG_FILE)
+
+
+def host_user(host):
+    entry = load_config()["hosts"].get(host) or {}
+    user = entry.get("user") if isinstance(entry, dict) else None
+    return user if isinstance(user, str) and USER_RE.match(user) else None
+
+
+def check_host(host):
+    if not host or not HOST_RE.match(host) or host.startswith("-"):
+        fail("Invalid host name: %r" % host)
+    return host
+
+
+# --------------------------------------------------------------------- ssh
+
+def ssh_opts(host, batch=True):
+    os.makedirs(RUNTIME, mode=0o700, exist_ok=True)
+    opts = [
+        "-o", "ConnectTimeout=8",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ControlMaster=auto",
+        "-o", "ControlPath=" + os.path.join(RUNTIME, "cm-%C"),
+        "-o", "ControlPersist=10m",
+        "-o", "ServerAliveInterval=15",
+        "-o", "LogLevel=ERROR",
+    ]
+    if batch:
+        opts += ["-o", "BatchMode=yes"]
+    user = host_user(host)
+    if user:
+        opts += ["-o", "User=" + user]
+    return opts
+
+
+def clean_stderr(text):
+    lines = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("**") or line.startswith("sftp>") or line.startswith("Connected to "):
+            continue
+        lines.append(line)
+    return lines
+
+
+def classify(stderr_lines):
+    text = "\n".join(stderr_lines)
+    if "Permission denied (" in text or "Too many authentication failures" in text:
+        return "auth"
+    if "Host key verification failed" in text or "IDENTIFICATION HAS CHANGED" in text:
+        return "hostkey"
+    for marker in ("Could not resolve hostname", "timed out", "No route to host",
+                   "Connection refused", "Network is unreachable", "Connection closed",
+                   "Connection reset", "kex_exchange_identification"):
+        if marker in text:
+            return "unreachable"
+    if "No such file" in text or "not found" in text:
+        return "notfound"
+    if "Permission denied" in text:
+        return "denied"
+    return "other"
+
+
+def error_text(stderr_lines, fallback):
+    useful = [l for l in stderr_lines if l not in ("Connection closed", "Connection closed.")
+              and not l.startswith("Connected to ")]
+    for l in useful:
+        if "Permission denied (" in l or "Could not resolve" in l or "timed out" in l:
+            return l
+    return useful[-1] if useful else (stderr_lines[-1] if stderr_lines else fallback)
+
+
+def sftp_quote(path):
+    return '"' + path.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def run_sftp(host, commands, timeout=60):
+    """Run sftp batch commands; return (rc, stdout, stderr_lines)."""
+    # No -q: it would also silence ssh's own "Permission denied" diagnostics.
+    cmd = ["sftp"] + ssh_opts(host) + ["-b", "-", host]
+    try:
+        proc = subprocess.run(cmd, input="\n".join(commands) + "\n", capture_output=True,
+                              text=True, timeout=timeout, env=ENV)
+    except subprocess.TimeoutExpired:
+        return 124, "", ["Timed out talking to " + host]
+    return proc.returncode, proc.stdout, clean_stderr(proc.stderr)
+
+
+def run_ssh(host, remote_cmd, timeout=30):
+    cmd = ["ssh"] + ssh_opts(host) + [host, remote_cmd]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                              env=ENV, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return 124, "", ["Timed out talking to " + host]
+    return proc.returncode, proc.stdout, clean_stderr(proc.stderr)
+
+
+def probe(host, use_cache=True):
+    path = os.path.join(RUNTIME, "probe-" + host + ".json")
+    if use_cache:
+        try:
+            if time.time() - os.path.getmtime(path) < 600:
+                with open(path) as fh:
+                    return json.load(fh)
+        except (OSError, ValueError):
+            pass
+    rc, stdout, err = run_ssh(host, 'echo __TF__; uname -s; command -v rsync >/dev/null 2>&1 && echo rsync=yes || echo rsync=no; printf "%s\\n" "$HOME"')
+    if rc == 255:
+        kind = classify(err)
+        return {"ok": False, "kind": kind, "error": error_text(err, "Could not connect to " + host)}
+    lines = [l.strip() for l in stdout.splitlines()]
+    info = {"ok": True, "posix": False, "rsync": False, "system": "", "home": ""}
+    if len(lines) >= 4 and lines[0] == "__TF__" and lines[1] in POSIX_SYSTEMS:
+        info.update(posix=True, system=lines[1], rsync=lines[2] == "rsync=yes", home=lines[3])
+    else:
+        info["system"] = "Windows"
+    try:
+        os.makedirs(RUNTIME, mode=0o700, exist_ok=True)
+        with open(path, "w") as fh:
+            json.dump(info, fh)
+    except OSError:
+        pass
+    return info
+
+
+# ----------------------------------------------------------------- listing
+
+MONTHS = {m: i + 1 for i, m in enumerate("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split())}
+LONG_RE = re.compile(r"^([-dlcbps][-rwxsStTl@+.]{9}\S*)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\d+)\s+"
+                     r"([A-Z][a-z]{2})\s+(\d{1,2})\s+(\d{1,2}:\d{2}|\d{4})\s(.*)$")
+
+
+def parse_mtime(mon, day, rest):
+    now = time.localtime()
+    month = MONTHS.get(mon, 1)
+    try:
+        if ":" in rest:
+            hour, minute = (int(x) for x in rest.split(":"))
+            year = now.tm_year
+            t = time.mktime((year, month, int(day), hour, minute, 0, 0, 0, -1))
+            if t > time.time() + 86400 * 2:
+                t = time.mktime((year - 1, month, int(day), hour, minute, 0, 0, 0, -1))
+            return int(t)
+        return int(time.mktime((int(rest), month, int(day), 0, 0, 0, 0, 0, -1)))
+    except (ValueError, OverflowError):
+        return 0
+
+
+def list_local(path):
+    path = os.path.abspath(os.path.expanduser(path or HOME))
+    if not os.path.isdir(path):
+        fail("Not a folder: " + path, "notfound")
+    entries = []
+    try:
+        it = os.scandir(path)
+    except PermissionError:
+        fail("Permission denied: " + path, "denied")
+    except OSError as e:
+        fail(str(e))
+    with it:
+        for e in it:
+            try:
+                lst = e.stat(follow_symlinks=False)
+                is_link = stat.S_ISLNK(lst.st_mode)
+                try:
+                    st = e.stat() if is_link else lst
+                except OSError:
+                    st = lst
+                kind = "dir" if stat.S_ISDIR(st.st_mode) else "file"
+                entries.append({
+                    "name": e.name, "type": kind, "link": is_link,
+                    "size": st.st_size if kind == "file" else 0,
+                    "mtime": int(st.st_mtime), "perm": stat.filemode(st.st_mode),
+                })
+            except OSError:
+                continue
+    return {"ok": True, "path": path, "entries": entries, "home": HOME}
+
+
+def sftp_entries(stdout):
+    entries = []
+    pwd = ""
+    for line in stdout.splitlines():
+        if line.startswith("Remote working directory: "):
+            pwd = line[len("Remote working directory: "):].strip()
+            continue
+        m = LONG_RE.match(line)
+        if not m:
+            continue
+        perm, size, mon, day, rest, name = m.group(1), int(m.group(5)), m.group(6), m.group(7), m.group(8), m.group(9)
+        target = ""
+        kind = {"d": "dir", "l": "link"}.get(perm[0], "file")
+        if kind == "link" and " -> " in name:
+            name, target = name.split(" -> ", 1)
+        if name in (".", ".."):
+            continue
+        entries.append({"name": name, "type": kind, "link": kind == "link", "target": target,
+                        "size": size if kind == "file" else 0,
+                        "mtime": parse_mtime(mon, day, rest), "perm": perm})
+    return pwd, entries
+
+
+def list_remote(host, path):
+    cmds = []
+    if path:
+        cmds.append("cd " + sftp_quote(path))
+    cmds += ["pwd", "ls -lan"]
+    rc, stdout, err = run_sftp(host, cmds)
+    if rc != 0:
+        fail(error_text(err, "Could not list " + (path or "home") + " on " + host), classify(err))
+    pwd, entries = sftp_entries(stdout)
+    # Links whose target is a folder should open like folders. Ask the server
+    # in one round trip which of them `cd` into.
+    # Each check prints one working directory: unchanged means the cd failed.
+    links = [e for e in entries if e["type"] == "link"][:200]
+    if links and pwd:
+        checks = ["cd " + sftp_quote(pwd)]
+        for e in links:
+            checks += ["-cd " + sftp_quote(join_remote(pwd, e["name"])), "pwd", "cd " + sftp_quote(pwd)]
+        _, so2, _ = run_sftp(host, checks)
+        seen = [l[len("Remote working directory: "):].strip() for l in so2.splitlines()
+                if l.startswith("Remote working directory: ")]
+        for i, e in enumerate(links):
+            e["type"] = "dir" if i < len(seen) and seen[i] != pwd else "file"
+    for e in entries:
+        if e["type"] == "link":
+            e["type"] = "file"
+    return {"ok": True, "path": pwd or path, "entries": entries}
+
+
+def join_remote(base, name):
+    if not base:
+        return name
+    return base.rstrip("/") + "/" + name if base != "/" else "/" + name
+
+
+# --------------------------------------------------------------- transfers
+
+PROGRESS2_RE = re.compile(r"(\d[\d,.]*\S*)\s+(\d{1,3})%\s+(\S+/s)")
+SCP_RE = re.compile(r"^(.*?)\s+(\d{1,3})%\s+(\S+)\s+(\S+/s)")
+child = None
+
+
+def kill_child(*_):
+    if child and child.poll() is None:
+        try:
+            os.killpg(child.pid, signal.SIGTERM)
+            child.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            os.killpg(child.pid, signal.SIGKILL)
+        except OSError:
+            pass
+    out({"event": "done", "ok": False, "cancelled": True, "error": "Cancelled"})
+    sys.exit(130)
+
+
+def remote_spec(target, path):
+    return path if target == "local" else target + ":" + path
+
+
+def stream(cmd, parse, use_pty):
+    """Run a transfer, emitting progress events. Returns (rc, stderr_lines)."""
+    global child
+    if use_pty:
+        master, slave = pty.openpty()
+
+        # scp only draws its meter when the pty is its controlling terminal
+        # and it is the foreground process group there.
+        def own_tty():
+            os.setsid()
+            fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+
+        child = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=slave, stderr=subprocess.PIPE,
+                                 env=ENV, preexec_fn=own_tty)
+        os.close(slave)
+        source = master
+    else:
+        child = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 env=ENV, start_new_session=True)
+        source = child.stdout.fileno()
+    errfd = child.stderr.fileno()
+    open_fds = {source, errfd}
+    buf = b""
+    errbuf = b""
+    last_emit = 0.0
+    while open_fds:
+        ready, _, _ = select.select(list(open_fds), [], [], 0.5)
+        for fd in ready:
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:
+                chunk = b""
+            if not chunk:
+                open_fds.discard(fd)
+                continue
+            if fd == errfd:
+                errbuf += chunk
+                continue
+            buf += chunk
+            parts = re.split(rb"[\r\n]", buf)
+            buf = parts.pop()
+            for raw in parts:
+                event = parse(raw.decode("utf-8", "replace"))
+                now = time.time()
+                if event and (now - last_emit > 0.25 or event.get("pct") == 100):
+                    last_emit = now
+                    out(dict({"event": "progress"}, **event))
+    child.wait()
+    if use_pty:
+        os.close(master)
+    return child.returncode, clean_stderr(errbuf.decode("utf-8", "replace"))
+
+
+def parse_rsync(line):
+    m = PROGRESS2_RE.search(line)
+    if not m:
+        return None
+    return {"pct": int(m.group(2)), "done": m.group(1), "rate": m.group(3)}
+
+
+def parse_scp(line):
+    m = SCP_RE.search(line.strip())
+    if not m:
+        return None
+    return {"pct": int(m.group(2)), "file": os.path.basename(m.group(1).strip()), "rate": m.group(4)}
+
+
+def cmd_copy(args):
+    if len(args) < 4:
+        fail("usage: copy SRC_TARGET DST_TARGET DST_DIR PATH...")
+    src, dst, dst_dir, paths = args[0], args[1], args[2], args[3:]
+    for t in (src, dst):
+        if t != "local":
+            check_host(t)
+    signal.signal(signal.SIGTERM, kill_child)
+    signal.signal(signal.SIGINT, kill_child)
+
+    remote = [t for t in (src, dst) if t != "local"]
+    use_rsync = shutil.which("rsync") is not None
+    for host in remote:
+        info = probe(host)
+        if not info.get("ok"):
+            out({"event": "done", "ok": False, "kind": info.get("kind"), "error": info.get("error")})
+            return 1
+        use_rsync = use_rsync and info.get("posix") and info.get("rsync")
+    if len(remote) == 2 or os.environ.get("TAILFILES_ENGINE") == "scp":
+        use_rsync = False  # rsync cannot copy between two remotes; scp -3 relays through here.
+
+    out({"event": "start", "engine": "rsync" if use_rsync else "scp", "count": len(paths)})
+    if use_rsync:
+        host = remote[0] if remote else None
+        cmd = ["rsync", "-a", "-h", "--partial", "--info=progress2", "--no-inc-recursive", "--outbuf=L"]
+        if host:
+            cmd += ["-e", "ssh " + " ".join(shlex.quote(o) for o in ssh_opts(host))]
+        cmd += ["--"] + [remote_spec(src, p.rstrip("/") or "/") for p in paths]
+        cmd.append(remote_spec(dst, dst_dir.rstrip("/") + "/"))
+        rc, err = stream(cmd, parse_rsync, use_pty=False)
+    else:
+        opts = ssh_opts(remote[0]) if len(remote) == 1 else ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=8"]
+        cmd = ["scp", "-r", "-p"] + (["-3"] if len(remote) == 2 else []) + opts
+        if len(remote) == 2:
+            # Each end may need its own user; scp takes those inline.
+            def spec(t, p):
+                u = host_user(t)
+                return (u + "@" if u else "") + t + ":" + p
+        else:
+            spec = remote_spec
+        cmd += ["--"] + [spec(src, p) for p in paths] + [spec(dst, dst_dir)]
+        rc, err = stream(cmd, parse_scp, use_pty=True)
+
+    if rc == 0:
+        out({"event": "done", "ok": True})
+        return 0
+    out({"event": "done", "ok": False, "kind": classify(err), "error": error_text(err, "Transfer failed (exit %d)" % rc)})
+    return 1
+
+
+# ---------------------------------------------------------------- file ops
+
+def guard_delete(path):
+    norm = path.rstrip("/") or "/"
+    if norm in ("/", HOME, "~") or re.match(r"^/?[A-Za-z]:/?$", norm) or norm.count("/") < 1:
+        fail("Refusing to delete " + path)
+
+
+def cmd_mkdir(target, path):
+    if target == "local":
+        try:
+            os.makedirs(path, exist_ok=False)
+        except OSError as e:
+            fail(str(e))
+    else:
+        rc, _, err = run_sftp(check_host(target), ["mkdir " + sftp_quote(path)])
+        if rc != 0:
+            fail(error_text(err, "Could not create folder"), classify(err))
+    out({"ok": True})
+
+
+def cmd_rename(target, old, new):
+    if target == "local":
+        if os.path.exists(new):
+            fail("Something named that already exists")
+        try:
+            os.rename(old, new)
+        except OSError as e:
+            fail(str(e))
+    else:
+        rc, _, err = run_sftp(check_host(target), ["rename " + sftp_quote(old) + " " + sftp_quote(new)])
+        if rc != 0:
+            fail(error_text(err, "Could not rename"), classify(err))
+    out({"ok": True})
+
+
+def sftp_walk_delete(host, path, cmds):
+    rc, stdout, err = run_sftp(host, ["cd " + sftp_quote(path), "pwd", "ls -lan"])
+    if rc != 0:
+        cmds.append("rm " + sftp_quote(path))
+        return
+    _, entries = sftp_entries(stdout)
+    for e in entries:
+        child_path = join_remote(path, e["name"])
+        if e["type"] == "dir":
+            sftp_walk_delete(host, child_path, cmds)
+        else:
+            cmds.append("rm " + sftp_quote(child_path))
+    cmds.append("rmdir " + sftp_quote(path))
+
+
+def cmd_delete(target, paths):
+    for p in paths:
+        guard_delete(p)
+    if target == "local":
+        trash = shutil.which("gio")
+        for p in paths:
+            if trash and subprocess.run([trash, "trash", "--", p], capture_output=True).returncode == 0:
+                continue
+            try:
+                if os.path.isdir(p) and not os.path.islink(p):
+                    shutil.rmtree(p)
+                else:
+                    os.remove(p)
+            except OSError as e:
+                fail(str(e))
+        out({"ok": True, "trashed": bool(trash)})
+        return
+    host = check_host(target)
+    info = probe(host)
+    if not info.get("ok"):
+        fail(info.get("error", "Could not connect"), info.get("kind", "other"))
+    if info.get("posix"):
+        rc, _, err = run_ssh(host, "rm -rf -- " + " ".join(shlex.quote(p) for p in paths), timeout=300)
+        if rc != 0:
+            fail(error_text(err, "Delete failed"), classify(err))
+    else:
+        cmds = []
+        for p in paths:
+            sftp_walk_delete(host, p, cmds)
+        rc, _, err = run_sftp(host, cmds, timeout=300)
+        if rc != 0:
+            fail(error_text(err, "Delete failed"), classify(err))
+    out({"ok": True, "trashed": False})
+
+
+def cmd_open(target, path):
+    if target != "local":
+        host = check_host(target)
+        dest_dir = os.path.join(CACHE_DIR, "open", host)
+        os.makedirs(dest_dir, exist_ok=True)
+        dest = os.path.join(dest_dir, os.path.basename(path.rstrip("/")) or "file")
+        cmd = ["scp", "-p", "-r"] + ssh_opts(host) + ["--", host + ":" + path, dest]
+        proc = subprocess.run(cmd, capture_output=True, text=True, env=ENV, stdin=subprocess.DEVNULL, timeout=600)
+        if proc.returncode != 0:
+            err = clean_stderr(proc.stderr)
+            fail(error_text(err, "Could not fetch file"), classify(err))
+        path = dest
+    subprocess.Popen(["xdg-open", path], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+    out({"ok": True, "path": path})
+
+
+# -------------------------------------------------------------------- peers
+
+def cmd_peers():
+    try:
+        proc = subprocess.run(["tailscale", "status", "--json"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        fail("tailscale is not available: %s" % e, "unreachable")
+    if proc.returncode != 0:
+        fail((proc.stderr or "tailscale status failed").strip().splitlines()[-1], "unreachable")
+    try:
+        data = json.loads(proc.stdout)
+    except ValueError:
+        fail("Could not read tailscale status")
+    magic = bool((data.get("CurrentTailnet") or {}).get("MagicDNSEnabled", True))
+    config = load_config()["hosts"]
+    peers = []
+    for p in (data.get("Peer") or {}).values():
+        ips = p.get("TailscaleIPs") or []
+        dns = (p.get("DNSName") or "").rstrip(".")
+        short = dns.split(".")[0] if dns else ""
+        host = short if (magic and short) else (ips[0] if ips else "")
+        if not host or not HOST_RE.match(host):
+            continue
+        os_name = p.get("OS") or ""
+        if os_name in ("iOS", "android", "tvOS"):
+            continue  # no SSH server to talk to
+        entry = config.get(host) if isinstance(config.get(host), dict) else {}
+        peers.append({
+            "host": host, "name": p.get("HostName") or short or host, "dns": dns,
+            "ip": ips[0] if ips else "", "os": os_name, "online": bool(p.get("Online")),
+            "user": entry.get("user") or "",
+            "tailscaleSsh": "https://tailscale.com/cap/ssh" in (p.get("CapMap") or {}) or bool(p.get("sshHostKeys")),
+        })
+    peers.sort(key=lambda x: (not x["online"], x["name"].lower()))
+    self_node = data.get("Self") or {}
+    out({"ok": True, "backend": data.get("BackendState"), "self": self_node.get("HostName") or "",
+         "user": os.environ.get("USER", ""), "last": load_config().get("last", ""), "peers": peers})
+
+
+def peer_os(host):
+    """The OS Tailscale reports for a host, lowercased, or "" if unknown."""
+    try:
+        proc = subprocess.run(["tailscale", "status", "--json"], capture_output=True, text=True, timeout=10)
+        data = json.loads(proc.stdout)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return ""
+    for p in (data.get("Peer") or {}).values():
+        dns = (p.get("DNSName") or "").rstrip(".")
+        if host in (dns.split(".")[0], dns, p.get("HostName"), *(p.get("TailscaleIPs") or [])):
+            return (p.get("OS") or "").lower()
+    return ""
+
+
+# Windows OpenSSH reads administrators' keys from ProgramData, not the user's
+# profile, and only if that file is locked down to Administrators and SYSTEM.
+WINDOWS_ADD_KEY = r"""
+$ErrorActionPreference = 'Stop'
+$key = '__KEY__'
+function Add-Key($file) {
+  $dir = Split-Path $file
+  if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+  if ((Test-Path $file) -and (Select-String -Path $file -SimpleMatch $key -Quiet)) { return 'already there' }
+  Add-Content -Path $file -Value $key -Encoding ascii
+  return 'added'
+}
+$r = Add-Key (Join-Path $env:USERPROFILE '.ssh\authorized_keys')
+Write-Output ('User key file: ' + $r)
+$admin = [Security.Principal.WindowsIdentity]::GetCurrent().Groups | Where-Object { $_.Value -eq 'S-1-5-32-544' }
+if ($admin) {
+  $f = Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'
+  $r = Add-Key $f
+  icacls.exe $f /inheritance:r /grant '*S-1-5-32-544:F' /grant '*S-1-5-18:F' | Out-Null
+  Write-Output ('Administrator key file: ' + $r)
+}
+"""
+
+
+def cmd_setup_key(host):
+    host = check_host(host)
+    user = host_user(host) or os.environ.get("USER", "")
+    ssh_dir = os.path.join(HOME, ".ssh")
+    pub = next((os.path.join(ssh_dir, k) for k in ("id_ed25519.pub", "id_ecdsa.pub", "id_rsa.pub")
+                if os.path.exists(os.path.join(ssh_dir, k))), None)
+    if not pub:
+        os.makedirs(ssh_dir, mode=0o700, exist_ok=True)
+        key = os.path.join(ssh_dir, "id_ed25519")
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-f", key, "-N", ""], check=False,
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        pub = key + ".pub"
+    try:
+        with open(pub) as fh:
+            pubkey = fh.read().strip()
+    except OSError:
+        fail("Could not read your public key " + pub)
+
+    who = user + "@" + host
+    target = shlex.quote(who)
+    lines = ["echo 'Setting up SSH key sign-in to %s'" % who, "echo",
+             "echo 'You will be asked for the password of %s on %s once.'" % (user, host), "echo"]
+    if peer_os(host) == "windows":
+        ps = WINDOWS_ADD_KEY.replace("__KEY__", pubkey.replace("'", "''"))
+        encoded = base64.b64encode(ps.encode("utf-16-le")).decode()
+        remote = "powershell -NoProfile -NonInteractive -EncodedCommand " + encoded
+        lines.append("ssh -o StrictHostKeyChecking=accept-new %s %s" % (target, shlex.quote(remote)))
+    else:
+        lines.append("ssh-copy-id -i %s -o StrictHostKeyChecking=accept-new %s" % (shlex.quote(pub), target))
+    # Prove it worked rather than trusting the installer's own report.
+    lines += [
+        "echo",
+        "if ssh -o BatchMode=yes -o ConnectTimeout=8 %s exit 2>/dev/null; then "
+        "echo 'Key sign-in works. Press Retry in Tailnet Files.'; "
+        "else echo 'Key sign-in still fails. Your public key is:'; cat %s; exit 1; fi"
+        % (target, shlex.quote(pub)),
+    ]
+    script = "; ".join(lines)
+    launcher = shutil.which("omarchy-launch-floating-terminal-with-presentation")
+    if launcher:
+        cmd = [launcher, "bash -c " + shlex.quote(script)]
+    else:
+        cmd = ["xdg-terminal-exec", "bash", "-c", script + "; read -p 'Press enter to close'"]
+    subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+    # The next probe must see the new key rather than a cached failure.
+    try:
+        os.remove(os.path.join(RUNTIME, "probe-" + host + ".json"))
+    except OSError:
+        pass
+    out({"ok": True})
+
+
+# --------------------------------------------------------------------- main
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    cmd, args = argv[0], argv[1:]
+    if cmd == "peers":
+        cmd_peers()
+    elif cmd == "probe" and len(args) == 1:
+        info = probe(check_host(args[0]), use_cache=False)
+        out(info)
+        return 0 if info.get("ok") else 1
+    elif cmd == "ls" and len(args) in (1, 2):
+        path = args[1] if len(args) == 2 else ""
+        out(list_local(path) if args[0] == "local" else list_remote(check_host(args[0]), path))
+    elif cmd == "copy":
+        return cmd_copy(args)
+    elif cmd == "mkdir" and len(args) == 2:
+        cmd_mkdir(*args)
+    elif cmd == "rename" and len(args) == 3:
+        cmd_rename(*args)
+    elif cmd == "delete" and len(args) >= 2:
+        cmd_delete(args[0], args[1:])
+    elif cmd == "open" and len(args) == 2:
+        cmd_open(*args)
+    elif cmd == "config":
+        out(dict({"ok": True}, **load_config()))
+    elif cmd == "set-user" and len(args) in (1, 2):
+        host = check_host(args[0])
+        user = args[1].strip() if len(args) == 2 else ""
+        if user and not USER_RE.match(user):
+            fail("Invalid user name")
+        data = load_config()
+        if user:
+            data["hosts"][host] = dict(data["hosts"].get(host) or {}, user=user)
+        else:
+            data["hosts"].pop(host, None)
+        save_config(data)
+        try:
+            os.remove(os.path.join(RUNTIME, "probe-" + host + ".json"))
+        except OSError:
+            pass
+        out({"ok": True})
+    elif cmd == "remember" and len(args) == 1:
+        data = load_config()
+        data["last"] = check_host(args[0])
+        save_config(data)
+        out({"ok": True})
+    elif cmd == "setup-key" and len(args) == 1:
+        cmd_setup_key(args[0])
+    else:
+        fail("Unknown command: " + " ".join(argv))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]) or 0)
