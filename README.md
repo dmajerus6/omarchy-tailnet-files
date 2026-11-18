@@ -27,8 +27,8 @@ Then click the folder icon in the bar.
 - Optional: `rsync` on both ends for resumable copies, `gio` (glib2) to move local
   deletes to the Trash, `notify-send` for "transfer finished" notifications
 
-The plugin needs no sudo and does not edit your Hyprland config, keybindings or
-`~/.ssh/config`. It writes only:
+The plugin runs as your user, needs no root access, and does not edit your
+Hyprland config, keybindings or `~/.ssh/config`. It writes only:
 
 - `~/.config/tailfiles/hosts.json`: the user name per machine and the last machine you opened
 - `~/.cache/tailfiles/open/`: remote files downloaded to open them locally
@@ -112,7 +112,7 @@ Then use one of these to sign in:
    permissions Windows OpenSSH requires. Either way, it then tries a key
    sign-in and tells you whether it worked.
 2. **Tailscale SSH.** On a Linux or macOS machine, run
-   `sudo tailscale set --ssh` and Tailscale handles sign-in. You don't need
+   `tailscale set --ssh` as root and Tailscale handles sign-in. You don't need
    keys.
 
 If your user name differs on a machine, use *Change user* in its pane. The

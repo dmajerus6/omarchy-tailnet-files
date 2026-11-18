@@ -25,7 +25,7 @@
   "error.generic": "Something went wrong",
   "error.genericTitle": "Could not open this folder",
   "error.authTitle": "Can't sign in to %1",
-  "error.authHelp": "Set up an SSH key so it signs you in automatically (you type the password once), use a different user name, or turn on Tailscale SSH on that machine with: sudo tailscale set --ssh",
+  "error.authHelp": "Set up an SSH key so it signs you in automatically (you type the password once), use a different user name, or turn on Tailscale SSH on that machine by running tailscale set --ssh as root",
   "error.unreachableTitle": "%1 isn't answering",
   "error.unreachableHelp": "Check that it is awake, on the tailnet, and has an SSH server running (macOS: System Settings › Sharing › Remote Login).",
   "error.hostkeyTitle": "The machine's identity changed",
