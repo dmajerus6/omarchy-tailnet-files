@@ -4,13 +4,14 @@
 Browses and moves files between this machine and the machines on your
 tailnet over SSH: listings go through SFTP (works against Linux, macOS and
 Windows OpenSSH alike), transfers through rsync when both ends have it and
-scp otherwise. Every command prints JSON on stdout so the QML side never has
+sftp otherwise. Every command prints JSON on stdout so the QML side never has
 to parse human output.
 
   tailfiles peers
   tailfiles probe HOST
   tailfiles ls TARGET [PATH]
-  tailfiles copy SRC_TARGET DST_TARGET DST_DIR PATH...   (streams JSON lines)
+  tailfiles [--as HOST=USER]... COMMAND ...   (pins the SSH account per host)
+  tailfiles copy [--replace] SRC_TARGET DST_TARGET DST_DIR PATH...   (streams JSON lines)
   tailfiles mkdir TARGET PATH
   tailfiles rename TARGET OLD NEW
   tailfiles delete TARGET PATH...
@@ -38,6 +39,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import termios
 import time
 
@@ -64,8 +66,16 @@ def out(obj):
     sys.stdout.flush()
 
 
+COPYING = False  # copy streams events, so its failures are "done" events
+MUTED = False    # set while cleaning up after a copy has reported its result
+
+
 def fail(message, kind="other", **extra):
-    out(dict({"ok": False, "error": message, "kind": kind}, **extra))
+    if not MUTED:
+        obj = dict({"ok": False, "error": message, "kind": kind}, **extra)
+        if COPYING:
+            obj["event"] = "done"
+        out(obj)
     sys.exit(1)
 
 
@@ -493,14 +503,27 @@ def basename_of(path):
     return path.rstrip("/").rpartition("/")[2]
 
 
+# Whether exact paths exist on a POSIX machine, as the filesystem itself
+# looks them up (so on a case-insensitive volume a name that differs only in
+# case counts). Prints one 0 or 1 per path, in order; the paths arrive
+# NUL-separated on stdin. A dangling symlink counts as existing.
+EXISTS_CMD = ("xargs -0 sh -c 'for p do if [ -e \"$p\" ] || [ -L \"$p\" ]; "
+              "then printf 1; else printf 0; fi; done' sh")
+
+
 def existing_names(target, folder, wanted):
     """Which of `wanted` (plain names) already exist in `folder`."""
     if target == "local":
         return [n for n in wanted if os.path.lexists(os.path.join(folder, n))]
     host = check_host(target)
+    if not wanted:
+        return []
     if probe(host).get("posix"):
-        have = exact_names(host, folder)
-        return [n for n in wanted if n in have]
+        check_path(folder)
+        rc, stdout, err = run_ssh(host, EXISTS_CMD, input_data="".join(join_remote(folder, n) + "\0" for n in wanted))
+        if rc != 0 or len(stdout) != len(wanted) or set(stdout) - {"0", "1"}:
+            fail(error_text(err, "Couldn't check what already exists in " + folder), classify(err))
+        return [n for n, c in zip(wanted, stdout) if c == "1"]
     # No shell: ask sftp about each exact path. `ls` of something that exists
     # prints at least one line (a folder lists . and ..); of nothing, none.
     cmds = ["-ls -lan " + sftp_quote(join_remote(folder, n)) for n in wanted]
@@ -564,7 +587,8 @@ def kill_child(*_):
             os.killpg(child.pid, signal.SIGKILL)
         except OSError:
             pass
-    out({"event": "done", "ok": False, "cancelled": True, "error": "Cancelled"})
+    if not MUTED:
+        out({"event": "done", "ok": False, "cancelled": True, "error": "Cancelled"})
     sys.exit(130)
 
 
@@ -657,6 +681,8 @@ def parse_scp(line):
 
 
 def cmd_copy(args):
+    global COPYING
+    COPYING = True  # from here on every failure is reported as a "done" event
     replace = bool(args) and args[0] == "--replace"
     if replace:
         args = args[1:]
@@ -666,72 +692,331 @@ def cmd_copy(args):
     for t in (src, dst):
         if t != "local":
             check_host(t)
-    signal.signal(signal.SIGTERM, kill_child)
-    signal.signal(signal.SIGINT, kill_child)
+    for p in paths + [dst_dir]:
+        if CONTROL_RE.search(p):
+            fail("%r contains a control character, so it can't be copied safely" % p)
+    paths = [p.rstrip("/") or "/" for p in paths]
+    names = [basename_of(p) for p in paths]
+    if any(n in ("", ".", "..") for n in names) or len(set(names)) != len(names):
+        fail("Each item to copy needs its own name")
 
     remote = [t for t in (src, dst) if t != "local"]
-    use_rsync = shutil.which("rsync") is not None and rsync_escapes_args()
     for host in remote:
         info = probe(host)
         if not info.get("ok"):
-            out({"event": "done", "ok": False, "kind": info.get("kind"), "error": info.get("error")})
-            return 1
-        use_rsync = use_rsync and info.get("posix") and info.get("rsync")
-    if len(remote) == 2 or os.environ.get("TAILFILES_ENGINE") == "scp":
-        use_rsync = False  # rsync cannot copy between two remotes; scp -3 relays through here.
-    # rsync passes remote paths through the remote shell with wildcards left
-    # unescaped, and the far end (a shell or rsync's own glob, depending on
-    # the implementation) expands them. No one escaping is right for every
-    # rsync, so such names go through scp, whose SFTP mode we escape exactly.
-    remote_paths = (paths if src != "local" else []) + ([dst_dir] if dst != "local" else [])
-    if any(RSYNC_WILDCARDS.search(p) for p in remote_paths):
-        use_rsync = False
-    for p in paths + [dst_dir]:
-        if CONTROL_RE.search(p):
-            out({"event": "done", "ok": False, "kind": "other",
-                 "error": "%r contains a control character, so it can't be copied safely" % p})
-            return 1
-
-    # Never overwrite without the user's say-so: unless --replace, refuse when
-    # any item already exists at the destination (the window then asks).
-    if not replace:
-        clash = existing_names(dst, dst_dir, [basename_of(p) for p in paths])
-        if clash:
-            out({"event": "done", "ok": False, "kind": "exists", "names": clash,
-                 "error": "%s already exist%s in %s" % (", ".join(clash[:3]) + ("…" if len(clash) > 3 else ""),
-                                                         "s" if len(clash) == 1 else "", dst_dir)})
-            return 1
-
-    out({"event": "start", "engine": "rsync" if use_rsync else "scp", "count": len(paths)})
-    if use_rsync:
-        host = remote[0] if remote else None
-        cmd = ["rsync", "--no-old-args", "-a", "-h", "--partial", "--info=progress2", "--no-inc-recursive", "--outbuf=L"]
-        if not replace:
-            cmd.append("--ignore-existing")  # in case something appeared since the check
-        if host:
-            cmd += ["-e", "ssh " + " ".join(shlex.quote(o) for o in ssh_opts(host))]
-        cmd += ["--"] + [remote_spec(src, p.rstrip("/") or "/") for p in paths]
-        cmd.append(remote_spec(dst, dst_dir.rstrip("/") + "/"))
-        rc, err = stream(cmd, parse_rsync, use_pty=False)
+            fail(info.get("error", "Could not connect to " + host), info.get("kind", "other"))
+    if not remote:
+        engine = "local"
+    elif (len(remote) == 1 and os.environ.get("TAILFILES_ENGINE") not in ("sftp", "scp")
+          and shutil.which("rsync") and rsync_escapes_args()
+          and all(probe(h).get("posix") and probe(h).get("rsync") for h in remote)
+          # rsync leaves wildcards in remote paths for the far end to expand,
+          # so such names go through sftp, which we escape exactly.
+          and not any(RSYNC_WILDCARDS.search(p)
+                      for p in (paths if src != "local" else []) + ([dst_dir] if dst != "local" else []))):
+        engine = "rsync"
     else:
-        opts = ssh_opts(remote[0]) if len(remote) == 1 else ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=8"]
-        cmd = ["scp", "-r", "-p"] + (["-3"] if len(remote) == 2 else []) + opts
-        if len(remote) == 2:
-            # Each end may need its own user; scp takes those inline.
-            def spec(t, p):
-                return account(t) + "@" + t + ":" + p
-        else:
-            spec = remote_spec
-        # Sources are globbed by scp's SFTP mode; the destination is not.
-        sources = [spec(src, p if src == "local" else glob_escape(p)) for p in paths]
-        cmd += ["--"] + sources + [spec(dst, dst_dir)]
-        rc, err = stream(cmd, parse_scp, use_pty=True)
+        engine = "sftp"
 
-    if rc == 0:
+    # Never overwrite without the user's say-so: unless --replace, refuse up
+    # front when anything by these names is already there (the window then
+    # offers to replace). The filesystem itself is asked, so a name that
+    # differs only in case counts on a case-insensitive volume. The copy then
+    # lands in a fresh folder and every item is moved into place with a
+    # rename that can't replace anything, so something that appears in the
+    # meantime is never overwritten either.
+    if not replace:
+        clash = existing_names(dst, dst_dir, names)
+        if clash:
+            fail(exists_text(clash, dst_dir), "exists", names=clash)
+
+    signal.signal(signal.SIGTERM, kill_child)
+    signal.signal(signal.SIGINT, kill_child)
+    out({"event": "start", "engine": engine, "count": len(paths)})
+    try:
+        return run_copy(engine, src, dst, dst_dir, paths, names, replace)
+    finally:
+        cleanup()
+
+
+def exists_text(clash, folder, partial=False):
+    shown = ", ".join(clash[:3]) + ("…" if len(clash) > 3 else "")
+    return "%s already exist%s in %s%s" % (shown, "s" if len(clash) == 1 else "", folder,
+                                            "; everything else was copied" if partial else "")
+
+
+def run_copy(engine, src, dst, dst_dir, paths, names, replace):
+    skipped = 0
+    if engine == "rsync" and replace:
+        # rsync replaces files and links in place of following them, and
+        # merges folders. It copies symlinks as symlinks, never their targets.
+        rc, err = run_rsync(src, dst, paths, dst_dir)
+        if rc != 0:
+            fail(error_text(err, "Transfer failed (exit %d)" % rc), classify(err))
         out({"event": "done", "ok": True})
         return 0
-    out({"event": "done", "ok": False, "kind": classify(err), "error": error_text(err, "Transfer failed (exit %d)" % rc)})
-    return 1
+
+    stage = make_stage(dst, dst_dir)
+    items = list(zip(names, paths))
+    tree = None  # local copies of what was staged remotely, to plan a merge
+    if engine == "rsync":
+        rc, err = run_rsync(src, dst, paths, stage)
+        if rc != 0:
+            fail(error_text(err, "Transfer failed (exit %d)" % rc), classify(err))
+    elif engine == "local":
+        skipped += copy_local(items, stage)
+    else:
+        # sftp copies regular files and folders only: symlinks (and devices,
+        # sockets, pipes) are skipped, never followed, both among the
+        # selected items and inside folders.
+        kinds = source_kinds(src, paths)
+        kept = [(n, p) for n, p in items if kinds.get(p) in ("dir", "file")]
+        skipped += len(items) - len(kept)
+        items = kept
+        if src == "local":
+            skipped += sftp_copy(dst, "put", items, stage)
+            tree = items
+        elif dst == "local":
+            skipped += sftp_copy(src, "get", items, stage)
+        else:
+            # Between two machines: relay through a private folder here.
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            relay = tempfile.mkdtemp(prefix="relay-", dir=CACHE_DIR)
+            CLEANUP.append(("local", relay))
+            skipped += sftp_copy(src, "get", items, relay)
+            tree = [(n, os.path.join(relay, n)) for n, _ in items]
+            skipped += sftp_copy(dst, "put", tree, stage)
+    moved = [n for n, _ in items]
+
+    conflicts = []
+    if dst == "local":
+        move_local(stage, dst_dir, moved, replace, conflicts)
+    elif not replace:
+        left = move_remote_noreplace(check_host(dst), stage, dst_dir, moved)
+        conflicts = existing_names(dst, dst_dir, left)
+        if len(conflicts) != len(left):
+            fail("Couldn't move %s into %s" % (", ".join(n for n in left if n not in conflicts), dst_dir))
+    else:
+        host = check_host(dst)
+        cmds = []
+        plan_remote_merge(host, stage, dst_dir, tree, cmds, conflicts)
+        rc, _, err = run_sftp(host, cmds, timeout=300)
+        if rc != 0:
+            fail(error_text(err, "Couldn't move the copied items into " + dst_dir), classify(err))
+    if conflicts:
+        if replace:
+            fail("Couldn't replace %s: a folder can only replace a folder, and a file a file or link"
+                 % ", ".join(conflicts[:3]))
+        fail(exists_text(conflicts, dst_dir, partial=len(conflicts) < len(moved)), "exists", names=conflicts)
+    out({"event": "done", "ok": True, "skipped": skipped})
+    return 0
+
+
+def run_rsync(src, dst, paths, into):
+    remote = [t for t in (src, dst) if t != "local"]
+    cmd = ["rsync", "--no-old-args", "-a", "-h", "--partial", "--info=progress2", "--no-inc-recursive", "--outbuf=L"]
+    if remote:
+        cmd += ["-e", "ssh " + " ".join(shlex.quote(o) for o in ssh_opts(remote[0]))]
+    cmd += ["--"] + [remote_spec(src, p) for p in paths]
+    cmd.append(remote_spec(dst, into.rstrip("/") + "/"))
+    return stream(cmd, parse_rsync, use_pty=False)
+
+
+STAGE_PREFIX = ".tailfiles-incoming-"
+CLEANUP = []  # (target, folder) this copy created and removes when it ends
+
+
+def make_stage(target, dst_dir):
+    """A new, empty folder inside dst_dir that only this copy writes into.
+    Creating it fails if the name is taken, so nothing else is ever in it."""
+    name = STAGE_PREFIX + os.urandom(8).hex()
+    if target == "local":
+        path = os.path.join(dst_dir, name)
+        try:
+            os.mkdir(path, 0o700)
+        except OSError as e:
+            fail("Can't write to %s (%s)" % (dst_dir, e.strerror), "denied" if e.errno == errno.EACCES else "other")
+    else:
+        path = join_remote(dst_dir, name)
+        sftp_batch(check_host(target), ["mkdir " + sftp_quote(path)], what=dst_dir)
+    CLEANUP.append((target, path))
+    return path
+
+
+def cleanup():
+    """Remove the stage and relay folders. They hold only what this copy put
+    there (after a successful copy, at most empty folders)."""
+    global MUTED
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    MUTED = True
+    while CLEANUP:
+        target, path = CLEANUP.pop()
+        try:
+            if target == "local":
+                shutil.rmtree(path)  # never follows symlinks
+            elif probe(target).get("posix"):
+                run_ssh(target, POSIX_DELETE_CMD, timeout=300, input_data=path + "\0")
+            else:
+                cmds = []
+                sftp_walk_delete(target, path, cmds)
+                run_sftp(target, cmds, timeout=300)
+        except (OSError, SystemExit):
+            pass
+
+
+def lstat_kind(path):
+    try:
+        mode = os.lstat(path).st_mode
+    except OSError:
+        return None
+    return "dir" if stat.S_ISDIR(mode) else "file" if stat.S_ISREG(mode) else "link" if stat.S_ISLNK(mode) else "other"
+
+
+def remote_kinds(host, folder):
+    """{name: dir|file|link|other} for a folder's entries, as the server
+    lstat()s them (a link is reported as a link, not as its target)."""
+    segs = sftp_batch(host, ["cd " + sftp_quote(folder), "pwd", "ls -lan"], what=folder)
+    names = exact_names(host, pwd_value(segs[1])) if probe(host).get("posix") else None
+    entries, skipped = sftp_entries(segs[2], names)
+    if skipped:
+        fail("Some names in %s can't be read safely, so nothing was copied there" % folder)
+    return {e["name"]: {"-": "file", "d": "dir", "l": "link"}.get(e["perm"][0], "other") for e in entries}
+
+
+def source_kinds(src, paths):
+    """{path: kind} for the selected items themselves."""
+    if src == "local":
+        return {p: lstat_kind(p) for p in paths}
+    host = check_host(src)
+    kinds, by_parent = {}, {}
+    for p in paths:
+        parent, _, name = p.rpartition("/")
+        by_parent.setdefault(parent or "/", []).append((p, name))
+    for parent, group in by_parent.items():
+        have = remote_kinds(host, parent)
+        for p, name in group:
+            kinds[p] = have.get(name)
+    return kinds
+
+
+def sftp_copy(host, verb, items, into):
+    """get or put each (name, path) to into/name with sftp, which copies
+    regular files and folders and skips symlinks and special files inside
+    folders. Returns how many it skipped."""
+    host = check_host(host)
+    cmds = ["progress"]  # batch mode starts with the meter off
+    for name, p in items:
+        dest = (os.path.join(into, name) if verb == "get" else join_remote(into, name))
+        cmds.append("%s -r -p %s %s" % (verb, sftp_quote(p), sftp_quote(dest)))
+    fd, batch = tempfile.mkstemp(prefix="batch-", dir=RUNTIME if os.path.isdir(RUNTIME) else None)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(encode_raw("\n".join(cmds) + "\n"))
+        rc, err = stream(["sftp"] + ssh_opts(host) + ["-b", batch, host], parse_scp, use_pty=True)
+    finally:
+        os.unlink(batch)
+    not_regular = [l for l in err if l.endswith("not a regular file")]
+    if rc != 0:
+        err = [l for l in err if l not in not_regular]
+        fail(error_text(err, "Transfer failed (exit %d)" % rc), classify(err))
+    return len(not_regular)
+
+
+def copy_local(items, stage):
+    """Copy on this computer: symlinks stay symlinks, special files are
+    skipped. Returns how many were skipped."""
+    skipped = 0
+
+    def specials(folder, entries):
+        nonlocal skipped
+        bad = [e for e in entries if lstat_kind(os.path.join(folder, e)) == "other"]
+        skipped += len(bad)
+        return bad
+
+    for k, (name, p) in enumerate(items):
+        dest = os.path.join(stage, name)
+        kind = lstat_kind(p)
+        try:
+            if kind == "link":
+                os.symlink(os.readlink(p), dest)
+            elif kind == "dir":
+                shutil.copytree(p, dest, symlinks=True, ignore=specials)
+            elif kind == "file":
+                shutil.copy2(p, dest)
+            else:
+                skipped += 1
+        except (OSError, shutil.Error) as e:
+            fail("Couldn't copy %s (%s)" % (name, e))
+        out({"event": "progress", "pct": int(100 * (k + 1) / len(items)), "file": name, "rate": ""})
+    return skipped
+
+
+def move_local(stage, dst_dir, names, replace, conflicts):
+    """Move staged items into dst_dir. A rename that can't replace anything
+    puts each one in place. With replace, files and links replace files and
+    links (the link itself, never what it points to) and folders merge into
+    real folders; any other pairing is a conflict."""
+    for n in names:
+        s, d = os.path.join(stage, n), os.path.join(dst_dir, n)
+        if not os.path.lexists(s):
+            continue
+        try:
+            rename_noreplace(s, d)
+            continue
+        except FileExistsError:
+            if not replace:
+                conflicts.append(n)
+                continue
+        except OSError as e:
+            fail("Couldn't move %s into %s (%s)" % (n, dst_dir, e.strerror))
+        mine, theirs = lstat_kind(s), lstat_kind(d)
+        try:
+            if mine == "dir" and theirs == "dir":
+                move_local(s, d, sorted(os.listdir(s)), True, conflicts)
+            elif mine != "dir" and theirs in ("file", "link"):
+                os.replace(s, d)
+            else:
+                conflicts.append(d)
+        except OSError as e:
+            fail("Couldn't replace %s (%s)" % (d, e.strerror))
+
+
+def move_remote_noreplace(host, stage, dst_dir, names):
+    """Move staged items into dst_dir with the plain SFTP rename, which
+    refuses to replace (for files the server links, which is atomic). Returns
+    the names still in the stage."""
+    if not names:
+        return []
+    cmds = ["-rename -l %s %s" % (sftp_quote(join_remote(stage, n)), sftp_quote(join_remote(dst_dir, n)))
+            for n in names]
+    rc, _, err = run_sftp(host, cmds, timeout=300)
+    if rc != 0:
+        fail(error_text(err, "Couldn't move the copied items into " + dst_dir), classify(err))
+    return existing_names(host, stage, names)
+
+
+def plan_remote_merge(host, stage, dst_dir, items, cmds, conflicts):
+    """Queue renames that move staged items into dst_dir, merging folders.
+    `items` are (name, local copy) pairs describing what was staged. A file
+    replaces a file or link with posix-rename (the link itself, never what
+    it points to); a folder merges only into a real folder."""
+    have = remote_kinds(host, dst_dir)
+    for name, lp in items:
+        mine = lstat_kind(lp)
+        if mine not in ("dir", "file"):
+            continue  # sftp didn't copy it
+        s, d = join_remote(stage, name), join_remote(dst_dir, name)
+        theirs = have.get(name)
+        if theirs is None:
+            cmds.append("rename -l %s %s" % (sftp_quote(s), sftp_quote(d)))
+        elif mine == "dir" and theirs == "dir":
+            plan_remote_merge(host, s, d, [(c, os.path.join(lp, c)) for c in sorted(os.listdir(lp))],
+                              cmds, conflicts)
+        elif mine == "file" and theirs in ("file", "link"):
+            cmds.append("rename %s %s" % (sftp_quote(s), sftp_quote(d)))
+        else:
+            conflicts.append(d)
 
 
 # ---------------------------------------------------------------- file ops
@@ -976,7 +1261,7 @@ def cmd_open(target, path):
             shutil.rmtree(dest)
         elif os.path.lexists(dest):
             os.remove(dest)
-        cmd = ["scp", "-p", "-r"] + ssh_opts(host) + ["--", host + ":" + glob_escape(path), dest]
+        cmd = ["scp", "-p"] + ssh_opts(host) + ["--", host + ":" + glob_escape(path), dest]
         proc = subprocess.run(cmd, capture_output=True, text=True, env=ENV, stdin=subprocess.DEVNULL, timeout=600)
         if proc.returncode != 0:
             err = clean_stderr(proc.stderr)
@@ -1134,6 +1419,12 @@ def main(argv):
         check_host(host)
         if not user or not USER_RE.match(user):
             fail("Invalid account for %s" % host)
+        if PINNED_USERS.get(host, user) != user:
+            # Every connection to a host uses one account, so a copy between
+            # two accounts on the same machine can't be pinned both ways.
+            fail("Both sides are on %s but signed in as different accounts (%s and %s). "
+                 "Use the same account on both sides." % (host, PINNED_USERS[host], user), "account",
+                 **({"event": "done"} if "copy" in argv else {}))
         PINNED_USERS[host] = user
         argv = argv[2:]
     if not argv:

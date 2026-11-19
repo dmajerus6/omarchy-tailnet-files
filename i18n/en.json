@@ -51,7 +51,8 @@
   "transfer.cancelled": "Cancelled",
   "transfer.cancel": "Cancel",
   "transfer.dismiss": "Dismiss",
-  "transfer.exists": "%1. Copy again to choose whether to replace it.",
+  "transfer.replace": "Replace",
+  "transfer.doneSkipped": { "one": "Done, %1 link or special file skipped", "other": "Done, %1 links or special files skipped" },
 
   "notify.done": "Transfer finished",
   "notify.failed": "Transfer failed",
@@ -63,6 +64,7 @@
   "status.badName": "That name can't be used",
   "status.setupKey": "Finish setting up the key for %1 in the terminal, then press Retry",
   "status.deleting": "Deleting…",
+  "status.accountMismatch": "Both sides are on %1 but signed in as %2 and %3. Use the same account on both sides to copy",
   "status.dialogStale": "That side switched to another machine, account or folder, so nothing was changed",
   "status.deleted": "Deleted",
   "status.trashed": "Moved to Trash",

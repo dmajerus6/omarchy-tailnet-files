@@ -3,7 +3,7 @@
 An Omarchy shell plugin for browsing the machines on your tailnet and copying
 files and folders between them. It has two panes, one per side. Each side can
 be this computer or any machine on your tailnet. Folders are listed over SFTP
-and copied with rsync, or with scp when rsync isn't available, all over SSH
+and copied with rsync, or with sftp when rsync isn't available, all over SSH
 inside your tailnet.
 
 Plugin id: `dmaje.tailfiles`
@@ -99,7 +99,7 @@ Each machine needs an SSH server you can sign in to without a password prompt:
 - **Linux / Raspberry Pi:** `sshd` running.
 - **macOS:** System Settings › General › Sharing › Remote Login.
 - **Windows:** the built-in "OpenSSH Server" optional feature. Browsing and
-  copying use SFTP and scp, so Windows doesn't need rsync.
+  copying use SFTP, so Windows doesn't need rsync.
 
 Then use one of these to sign in:
 
@@ -133,10 +133,29 @@ setting is saved in `~/.config/tailfiles/hosts.json`. Settings in
 - New host keys are accepted the first time (`StrictHostKeyChecking=accept-new`).
   After that, a changed key is refused. Tailscale already confirms which
   machine you're talking to.
-- Copies use `rsync -a --partial` when both ends have rsync, so an
-  interrupted copy picks up where it stopped. Otherwise they use `scp -r -p`.
-  Copies between two remote machines use `scp -3`, which routes the data
-  through this computer.
+- Copies use `rsync -a` when both ends have rsync, and `sftp` (`get`/`put
+  -r -p`) otherwise. Copies between two remote machines go through sftp and
+  a private folder on this computer, which is removed afterwards.
+- Symlinks are never followed when copying. rsync copies them as symlinks;
+  sftp skips them (and devices, sockets and pipes), both among the selected
+  items and inside folders, and the finished copy says how many it skipped.
+  Copies on this computer keep symlinks as symlinks.
+- Without Replace, a copy goes into a new hidden folder
+  (`.tailfiles-incoming-…`) inside the destination, which only that copy
+  writes to. Each item is then moved into place with a rename that refuses
+  to replace anything: `renameat2(RENAME_NOREPLACE)` here, the plain SFTP
+  rename remotely (atomic for files; for folders the server checks just
+  before moving). So a name that appears during the copy, or that differs
+  only in case on a case-insensitive disk such as macOS's, is never
+  overwritten. The hidden folder is removed when the copy ends, including
+  when it fails or is cancelled.
+- With Replace, files replace files or symlinks by rename (a symlink is
+  replaced itself, never written through), folders merge into real folders,
+  and a file never replaces a folder or the other way round. rsync handles
+  Replace the same way on its own.
+- The account is fixed per machine for a whole run, so both sides of a copy
+  between two panes on one machine must use the same account; the window
+  and the helper refuse otherwise.
 - Remote folder listings come from sftp's text output, read exactly: no
   trimming, and lines split only at `\n`. On Linux and macOS every listed
   name is also checked against the folder's exact names (a fixed
@@ -144,11 +163,11 @@ setting is saved in `~/.config/tailfiles/hosts.json`. Settings in
   line break or a non-printable character, is left out rather than guessed.
 - Paths are always handled literally, even names with `*`, `?`, `[`, quotes
   or spaces. SFTP commands escape every special character the way sftp(1)
-  documents, and scp source paths are escaped so they can't glob. rsync is
+  documents, so sftp never globs a name. rsync is
   used only when this computer has rsync 3.2.4 or newer, always with
   `--no-old-args`, so remote paths are escaped for the remote shell. rsync
   still leaves wildcards (`* ? [ ] \ ^ ~`) for the far end to expand, so a
-  copy that involves such a remote name goes through scp instead. Names
+  copy that involves such a remote name goes through sftp instead. Names
   containing control characters are refused.
 - Deleting on this computer only ever moves things to the Trash (`gio trash`).
   If that fails, the item stays where it is; there is no permanent fallback.
@@ -173,8 +192,8 @@ setting is saved in `~/.config/tailfiles/hosts.json`. Settings in
   listing was made under, so a dialog or copy acts as that account even if
   *Change user* saves another one meanwhile.
 - Nothing is overwritten without asking. Copying onto a name that already
-  exists asks to replace it first (files are replaced, folders merged), and
-  the helper refuses if it finds a clash the listing didn't show. Rename never
+  exists asks to replace it first. If the helper finds a clash the listing
+  didn't show, the copy stops and its row offers Replace. Rename never
   replaces an existing item (`renameat2(RENAME_NOREPLACE)` here, the plain
   SFTP rename remotely).
 - Files downloaded to open them lose their execute bits.

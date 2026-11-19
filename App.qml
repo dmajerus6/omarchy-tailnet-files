@@ -147,6 +147,15 @@ Item {
     if (items.length === 0) { setStatus(strings.t("status.nothingSelected"), true); return }
     if (src.blocked || dst.blocked || dst.path === "") { setStatus(strings.t("status.destinationNotReady"), true); return }
     if (src.target === dst.target && src.path === dst.path) { setStatus(strings.t("status.sameFolder"), true); return }
+    // Each side's account is pinned for the copy, so both must be known, and
+    // two sides on one machine must use the same account (one connection
+    // can't be two accounts).
+    if ((src.target !== "local" && src.loadedUser === "") || (dst.target !== "local" && dst.loadedUser === "")) {
+      setStatus(strings.t("status.destinationNotReady"), true); return
+    }
+    if (src.target !== "local" && src.target === dst.target && src.loadedUser !== dst.loadedUser) {
+      setStatus(strings.t("status.accountMismatch").arg(src.machine.name).arg(src.loadedUser).arg(dst.loadedUser), true); return
+    }
     var paths = []
     var names = []
     for (var i = 0; i < items.length; i++) { paths.push(items[i].path); names.push(items[i].name) }
@@ -178,7 +187,8 @@ Item {
       srcTarget: job.srcTarget, srcName: job.srcName, srcUser: job.srcUser || "",
       dstTarget: job.dstTarget, dstName: job.dstName, dstDir: job.dstDir, dstUser: job.dstUser || "",
       replace: !!job.replace,
-      pathsJson: JSON.stringify(job.paths),
+      pathsJson: JSON.stringify(job.paths), namesJson: JSON.stringify(job.names),
+      failKind: "", skipped: 0,
       label: job.names.length === 1 ? job.names[0] : strings.tn("transfer.items", job.names.length).arg(Commons.I18n.formatNumber(job.names.length)),
       jobState: "queued", pct: 0, rate: "", file: "", error: "", engine: ""
     })
@@ -214,6 +224,23 @@ Item {
     else if (j.jobState === "running") transferProc.signal(15)
   }
 
+  // A copy that stopped because something by that name is already there can
+  // be run again, as the same accounts and folders, replacing it. The click
+  // is the consent; the error on the row says what will be replaced.
+  function replaceJob(id) {
+    var i = jobIndex(id)
+    if (i < 0) return
+    var j = jobs.get(i)
+    if (j.jobState !== "failed" || j.failKind !== "exists") return
+    var job = {
+      srcTarget: j.srcTarget, srcName: j.srcName, srcUser: j.srcUser,
+      dstTarget: j.dstTarget, dstName: j.dstName, dstUser: j.dstUser, dstDir: j.dstDir,
+      paths: JSON.parse(j.pathsJson), names: JSON.parse(j.namesJson), replace: true
+    }
+    jobs.remove(i)
+    enqueue(job)
+  }
+
   function clearFinished() {
     for (var i = jobs.count - 1; i >= 0; i--) if (jobs.get(i).jobState !== "running" && jobs.get(i).jobState !== "queued") jobs.remove(i)
   }
@@ -231,8 +258,9 @@ Item {
     } else if (ev.event === "done") {
       jobs.setProperty(i, "jobState", ev.ok ? "done" : (ev.cancelled ? "cancelled" : "failed"))
       if (ev.ok) jobs.setProperty(i, "pct", 100)
-      if (!ev.ok) jobs.setProperty(i, "error", ev.kind === "exists" ? strings.t("transfer.exists").arg(String(ev.error))
-                                                                    : String(ev.error || strings.t("error.generic")))
+      jobs.setProperty(i, "skipped", Number(ev.skipped || 0))
+      jobs.setProperty(i, "failKind", String(ev.kind || ""))
+      if (!ev.ok) jobs.setProperty(i, "error", String(ev.error || strings.t("error.generic")))
     }
   }
 
@@ -674,6 +702,8 @@ Item {
             required property string file
             required property string error
             required property string engine
+            required property string failKind
+            required property int skipped
             width: jobList.width
             height: Style.space(28)
 
@@ -729,16 +759,27 @@ Item {
             }
             PlainText {
               id: jobMeta
-              anchors.right: jobCancel.left
+              anchors.right: jobReplace.visible ? jobReplace.left : jobCancel.left
               anchors.rightMargin: Style.space(8)
               anchors.verticalCenter: parent.verticalCenter
               color: root.dim
               font.pixelSize: Style.font.bodySmall
               elide: Text.ElideNone
-              text: jobRow.jobState === "running" ? (Commons.I18n.formatNumber(jobRow.pct) + "%" + (jobRow.rate ? "  " + jobRow.rate : "") + (jobRow.file && jobRow.engine === "scp" ? "  " + jobRow.file : ""))
+              text: jobRow.jobState === "running" ? (Commons.I18n.formatNumber(jobRow.pct) + "%" + (jobRow.rate ? "  " + jobRow.rate : "") + (jobRow.file && jobRow.engine !== "rsync" ? "  " + jobRow.file : ""))
                 : jobRow.jobState === "queued" ? strings.t("transfer.queued")
-                : jobRow.jobState === "done" ? strings.t("transfer.done")
+                : jobRow.jobState === "done" ? (jobRow.skipped > 0 ? strings.tn("transfer.doneSkipped", jobRow.skipped).arg(Commons.I18n.formatNumber(jobRow.skipped)) : strings.t("transfer.done"))
                 : jobRow.jobState === "cancelled" ? strings.t("transfer.cancelled") : ""
+            }
+            ActionButton {
+              id: jobReplace
+              anchors.right: jobCancel.left
+              anchors.rightMargin: Style.space(6)
+              anchors.verticalCenter: parent.verticalCenter
+              implicitHeight: Style.space(22)
+              visible: jobRow.jobState === "failed" && jobRow.failKind === "exists"
+              label: strings.t("transfer.replace")
+              fg: root.fg; accent: root.urgent
+              onClicked: root.replaceJob(jobRow.jobId)
             }
             ActionButton {
               id: jobCancel
