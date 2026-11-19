@@ -30,7 +30,6 @@ import hashlib
 import fcntl
 import json
 import os
-import pty
 import re
 import select
 import shlex
@@ -39,8 +38,7 @@ import signal
 import stat
 import subprocess
 import sys
-import tempfile
-import termios
+import threading
 import time
 
 HOME = os.path.expanduser("~")
@@ -328,28 +326,75 @@ def sftp_batch(host, commands, timeout=60, what="that folder"):
     return segs
 
 
+OUTPUT_LIMIT = 64 << 20   # what another machine may send back to one command
+ERROR_LIMIT = 64 << 10    # stderr kept (the end of it)
+FIELD_LIMIT = 64 << 10    # one name, link target or number in a copy stream
+
+
+def run_capped(cmd, data=None, timeout=60, limit=OUTPUT_LIMIT):
+    """Run cmd; returns (rc, stdout bytes, stderr bytes). Output beyond
+    `limit` stops the command (rc 125), so a misbehaving machine can't fill
+    this helper's memory."""
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE if data is not None else subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=ENV, start_new_session=True)
+    CHILDREN.append(proc)
+    if data is not None:
+        def feed():
+            try:
+                proc.stdin.write(data)
+                proc.stdin.close()
+            except OSError:
+                pass
+        threading.Thread(target=feed, daemon=True).start()
+    outb, errb = bytearray(), bytearray()
+    fds = {proc.stdout.fileno(): outb, proc.stderr.fileno(): errb}
+    deadline = time.time() + timeout
+    rc = None
+    while fds:
+        left = deadline - time.time()
+        if left <= 0:
+            rc = 124
+            break
+        ready, _, _ = select.select(list(fds), [], [], min(left, 1.0))
+        for fd in ready:
+            chunk = os.read(fd, 262144)
+            if not chunk:
+                del fds[fd]
+                continue
+            buf = fds[fd]
+            buf += chunk
+            if buf is errb and len(errb) > ERROR_LIMIT:
+                del errb[:len(errb) - ERROR_LIMIT]
+            if buf is outb and len(outb) > limit:
+                rc = 125
+        if rc is not None:
+            break
+    if rc is not None:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        proc.wait()
+        msg = "Timed out" if rc == 124 else "The reply was too large"
+        return rc, b"", (msg + "\n").encode()
+    proc.wait()
+    return proc.returncode, bytes(outb), bytes(errb)
+
+
 def run_sftp(host, commands, timeout=60):
     """Run sftp batch commands; return (rc, stdout, stderr_lines)."""
     # No -q: it would also silence ssh's own "Permission denied" diagnostics.
     cmd = ["sftp"] + ssh_opts(host) + ["-b", "-", host]
-    try:
-        proc = subprocess.run(cmd, input=encode_raw("\n".join(commands) + "\n"), capture_output=True,
-                              timeout=timeout, env=ENV)
-    except subprocess.TimeoutExpired:
-        return 124, "", ["Timed out talking to " + host]
-    return proc.returncode, decode_raw(proc.stdout), clean_stderr(proc.stderr.decode("utf-8", "replace"))
+    rc, so, se = run_capped(cmd, encode_raw("\n".join(commands) + "\n"), timeout)
+    return rc, decode_raw(so), clean_stderr(se.decode("utf-8", "replace"))
 
 
 def run_ssh(host, remote_cmd, timeout=30, input_data=None):
     """remote_cmd goes through the remote login shell, so it must be a
     fixed string; pass anything user-controlled as input_data on stdin."""
     cmd = ["ssh"] + ssh_opts(host) + [host, remote_cmd]
-    stdin = {"input": encode_raw(input_data)} if input_data is not None else {"stdin": subprocess.DEVNULL}
-    try:
-        proc = subprocess.run(cmd, capture_output=True, timeout=timeout, env=ENV, **stdin)
-    except subprocess.TimeoutExpired:
-        return 124, "", ["Timed out talking to " + host]
-    return proc.returncode, decode_raw(proc.stdout), clean_stderr(proc.stderr.decode("utf-8", "replace"))
+    rc, so, se = run_capped(cmd, encode_raw(input_data) if input_data is not None else None, timeout)
+    return rc, decode_raw(so), clean_stderr(se.decode("utf-8", "replace"))
 
 
 def sftp_home(host):
@@ -368,19 +413,19 @@ def probe(host, use_cache=True):
                     return json.load(fh)
         except (OSError, ValueError):
             pass
-    rc, stdout, err = run_ssh(host, 'echo __TF__; uname -s; command -v rsync >/dev/null 2>&1 && echo rsync=yes || echo rsync=no; printf "%s\\0" "$HOME"')
+    rc, stdout, err = run_ssh(host, 'echo __TF__; uname -s; printf "%s\\0" "$HOME"')
     if rc == 255:
         kind = classify(err)
         return {"ok": False, "kind": kind, "error": error_text(err, "Could not connect to " + host)}
-    lines = stdout.split("\n", 3)
-    info = {"ok": True, "posix": False, "rsync": False, "system": "", "home": ""}
-    if len(lines) == 4 and lines[0].strip() == "__TF__" and lines[1].strip() in POSIX_SYSTEMS:
+    lines = stdout.split("\n", 2)
+    info = {"ok": True, "posix": False, "system": "", "home": ""}
+    if len(lines) == 3 and lines[0].strip() == "__TF__" and lines[1].strip() in POSIX_SYSTEMS:
         # $HOME is printed NUL-terminated, so it is taken exactly; one with a
         # control character is unusable and left empty (deletes then refuse).
-        home, nul, _ = lines[3].partition("\0")
+        home, nul, _ = lines[2].partition("\0")
         if not nul or CONTROL_RE.search(home):
             home = ""
-        info.update(posix=True, system=lines[1].strip(), rsync=lines[2].strip() == "rsync=yes", home=home)
+        info.update(posix=True, system=lines[1].strip(), home=home)
     else:
         # Windows OpenSSH: no POSIX shell, but sftp starts in the profile
         # folder, e.g. /C:/Users/name.
@@ -514,20 +559,11 @@ def existing_names(target, folder, wanted):
     host = check_host(target)
     if not wanted:
         return []
-    if probe(host).get("posix"):
-        check_path(folder)
-        rc, stdout, err = run_ssh(host, EXISTS_CMD, input_data="".join(join_remote(folder, n) + "\0" for n in wanted))
-        if rc != 0 or len(stdout) != len(wanted) or set(stdout) - {"0", "1"}:
-            fail(error_text(err, "Couldn't check what already exists in " + folder), classify(err))
-        return [n for n, c in zip(wanted, stdout) if c == "1"]
-    # No shell: ask sftp about each exact path. `ls` of something that exists
-    # prints at least one line (a folder lists . and ..); of nothing, none.
-    cmds = ["-ls -lan " + sftp_quote(join_remote(folder, n)) for n in wanted]
-    rc, stdout, err = run_sftp(host, cmds)
-    segs = sftp_segments(stdout, cmds) if rc == 0 else None
-    if segs is None or len(segs) != len(cmds):
+    check_path(folder)
+    rc, stdout, err = run_ssh(host, EXISTS_CMD, input_data="".join(join_remote(folder, n) + "\0" for n in wanted))
+    if rc != 0 or len(stdout) != len(wanted) or set(stdout) - {"0", "1"}:
         fail(error_text(err, "Couldn't check what already exists in " + folder), classify(err))
-    return [n for n, seg in zip(wanted, segs) if seg]
+    return [n for n, c in zip(wanted, stdout) if c == "1"]
 
 
 def list_remote(host, path):
@@ -592,9 +628,8 @@ def join_remote(base, name):
 #
 # On Linux and macOS machines the remote half is a small fixed Perl
 # program (below) sent on stdin; paths travel as data, never through a
-# shell. Windows has no such way, see windows_home_only().
+# shell. Windows has no such way, so copies there are refused (WINDOWS_NO).
 
-SCP_RE = re.compile(r"^(.*?)\s+(\d{1,3})%\s+(\S+)\s+(\S+/s)")
 CHILDREN = []  # processes a cancel must stop
 
 
@@ -616,61 +651,6 @@ def kill_child(*_):
     if not MUTED:
         out({"event": "done", "ok": False, "cancelled": True, "error": "Cancelled"})
     sys.exit(130)
-
-
-def stream(cmd, parse):
-    """Run sftp under a pty so it draws its progress meter, emitting progress
-    events. Returns (rc, stderr_lines)."""
-    master, slave = pty.openpty()
-
-    # The meter is drawn only when the pty is the controlling terminal and
-    # sftp is the foreground process group there.
-    def own_tty():
-        os.setsid()
-        fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
-
-    child = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=slave, stderr=subprocess.PIPE,
-                             env=ENV, preexec_fn=own_tty)
-    CHILDREN.append(child)
-    os.close(slave)
-    source = master
-    errfd = child.stderr.fileno()
-    open_fds = {source, errfd}
-    buf = b""
-    errbuf = b""
-    last_emit = 0.0
-    while open_fds:
-        ready, _, _ = select.select(list(open_fds), [], [], 0.5)
-        for fd in ready:
-            try:
-                chunk = os.read(fd, 65536)
-            except OSError:
-                chunk = b""
-            if not chunk:
-                open_fds.discard(fd)
-                continue
-            if fd == errfd:
-                errbuf += chunk
-                continue
-            buf += chunk
-            parts = re.split(rb"[\r\n]", buf)
-            buf = parts.pop()
-            for raw in parts:
-                event = parse(raw.decode("utf-8", "replace"))
-                now = time.time()
-                if event and (now - last_emit > 0.25 or event.get("pct") == 100):
-                    last_emit = now
-                    out(dict({"event": "progress"}, **event))
-    child.wait()
-    os.close(master)
-    return child.returncode, clean_stderr(errbuf.decode("utf-8", "replace"))
-
-
-def parse_scp(line):
-    m = SCP_RE.search(line.strip())
-    if not m:
-        return None
-    return {"pct": int(m.group(2)), "file": os.path.basename(m.group(1).strip()), "rate": m.group(4)}
 
 
 def human(n):
@@ -731,6 +711,13 @@ def can_not_be_atomic(e):
     return e.errno in (errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP)
 
 
+def names_at(fd):
+    """Names in the folder fd holds. Rewound first: a listing of an fd that
+    was listed before can otherwise come back stale."""
+    os.lseek(fd, 0, os.SEEK_SET)
+    return os.listdir(fd)
+
+
 def open_top(path):
     try:
         return os.open(path, O_DIR)
@@ -767,7 +754,7 @@ def local_size(pfd, name):
         fd = open_dir_at(pfd, name)
         if fd is not None:
             try:
-                for n in os.listdir(fd):
+                for n in names_at(fd):
                     total += local_size(fd, n)
             finally:
                 os.close(fd)
@@ -798,7 +785,7 @@ def local_walk(pfd, name, rel):
             fail("%s changed while it was being copied" % rel)
         try:
             yield ("D", rel, stat.S_IMODE(mode), int(st.st_mtime))
-            for k in sorted(os.listdir(fd)):
+            for k in sorted(names_at(fd)):
                 if CONTROL_RE.search(k):
                     yield ("S",)
                 else:
@@ -833,21 +820,40 @@ def local_records(parent, names, prog):
 
 
 class LocalSink:
-    """Writes records into the new folder `stage` inside the folder `dfd`."""
+    """Makes the new folder `stage` inside the folder `dfd` holds and writes
+    records into it. The folder is held open from creation until it is
+    removed and never looked up by name again."""
 
     def __init__(self, dfd, stage):
+        self.dfd, self.stage = dfd, stage
+        try:
+            os.mkdir(stage, 0o700, dir_fd=dfd)
+        except OSError as e:
+            fail("Can't write there (%s)" % e.strerror, "denied" if e.errno == errno.EACCES else "other")
         self.sfd = open_dir_at(dfd, stage)
         if self.sfd is None:
             fail("The copy's new folder changed before anything was written")
-        self.stack = [("", self.sfd)]
-        self.fix = []
+        st = os.fstat(self.sfd)
+        if st.st_uid != os.geteuid() or stat.S_IMODE(st.st_mode) != 0o700 or names_at(self.sfd):
+            os.close(self.sfd)
+            fail("The copy's new folder was swapped for another one, so nothing was copied")
+        CLEANUP.append(("stage", self))
+        self.stack = [("", self.sfd, 0, 0)]
+
+    def pop(self):
+        _, fd, mode, mtime = self.stack.pop()
+        try:
+            os.fchmod(fd, (mode & 0o777) | 0o700)
+            os.utime(fd, (mtime, mtime))
+        finally:
+            os.close(fd)
 
     def parent(self, p):
         par, _, name = p.rpartition("/")
         while len(self.stack) > 1 and self.stack[-1][0] != par:
-            os.close(self.stack.pop()[1])
+            self.pop()
         if self.stack[-1][0] != par or name in ("", ".", ".."):
-            fail("Unexpected item in the copy: %r" % p)
+            fail("Unexpected item in the copy: %r" % p[:200])
         return self.stack[-1][1], name
 
     def write(self, rec, prog):
@@ -855,12 +861,13 @@ class LocalSink:
         pfd, name = self.parent(p)
         try:
             if kind == "D":
+                if len(self.stack) >= 512:
+                    fail("%s has folders nested more than 512 deep, so it can't be copied" % p.split("/")[0])
                 os.mkdir(name, 0o700, dir_fd=pfd)
                 fd = open_dir_at(pfd, name)
                 if fd is None:
                     fail("%s changed while it was being written" % p)
-                self.stack.append((p, fd))
-                self.fix.append((p, rec[2], rec[3]))
+                self.stack.append((p, fd, rec[2], rec[3]))
             elif kind == "F":
                 fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600,
                              dir_fd=pfd)
@@ -878,29 +885,52 @@ class LocalSink:
                 os.symlink(rec[2], name, dir_fd=pfd)
         except OSError as e:
             fail("Couldn't write %s (%s)" % (p, e.strerror))
+        except (OverflowError, ValueError):
+            fail("Couldn't write %s (its date can't be stored)" % p)
 
     def close(self):
         while len(self.stack) > 1:
-            os.close(self.stack.pop()[1])
-        for p, mode, mtime in reversed(self.fix):
-            fd, ok = self.sfd, True
-            for part in p.split("/"):
-                nfd = open_dir_at(fd, part)
-                if fd != self.sfd:
-                    os.close(fd)
-                if nfd is None:
-                    ok = False
-                    break
-                fd = nfd
-            if ok:
-                os.fchmod(fd, (mode & 0o777) | 0o700)
-                os.utime(fd, (mtime, mtime))
-                os.close(fd)
+            self.pop()
+
+    def remove(self):
+        """Empty the stage through the held handle, then remove its name
+        only while that name still is this very folder."""
+        remove_at(self.sfd)
+        try:
+            st = os.stat(self.stage, dir_fd=self.dfd, follow_symlinks=False)
+            mine = os.fstat(self.sfd)
+            if (st.st_dev, st.st_ino) == (mine.st_dev, mine.st_ino):
+                os.rmdir(self.stage, dir_fd=self.dfd)
+        except OSError:
+            pass
+        os.close(self.sfd)
 
 
-def place_local(sfd, dfd, rel, replace, conflicts, errors):
+def remove_at(fd, depth=0):
+    """Remove everything inside the folder fd holds, through held fds only."""
+    if depth > 512:
+        return
+    for n in names_at(fd):
+        try:
+            st = os.stat(n, dir_fd=fd, follow_symlinks=False)
+            if stat.S_ISDIR(st.st_mode):
+                c = open_dir_at(fd, n)
+                if c is None:
+                    continue
+                try:
+                    remove_at(c, depth + 1)
+                finally:
+                    os.close(c)
+                os.rmdir(n, dir_fd=fd)
+            else:
+                os.unlink(n, dir_fd=fd)
+        except OSError:
+            pass
+
+
+def place_local(sfd, dfd, rel, replace, conflicts, errors, depth=0):
     """Move everything in the folder sfd holds into the folder dfd holds."""
-    for n in sorted(os.listdir(sfd)):
+    for n in sorted(names_at(sfd)):
         r = rel + "/" + n if rel else n
         try:
             mine = os.stat(n, dir_fd=sfd, follow_symlinks=False).st_mode
@@ -921,12 +951,12 @@ def place_local(sfd, dfd, rel, replace, conflicts, errors):
         except OSError:
             conflicts.append(r)
             continue
-        if stat.S_ISDIR(mine) and stat.S_ISDIR(theirs):
+        if stat.S_ISDIR(mine) and stat.S_ISDIR(theirs) and depth < 512:
             cs, cd = open_dir_at(sfd, n), open_dir_at(dfd, n)
             if cs is None or cd is None:
                 conflicts.append(r)
             else:
-                place_local(cs, cd, r, True, conflicts, errors)
+                place_local(cs, cd, r, True, conflicts, errors, depth + 1)
             for fd in (cs, cd):
                 if fd is not None:
                     os.close(fd)
@@ -953,7 +983,7 @@ $SIG{PIPE} = 'DEFAULT';
 # A receive that doesn't finish removes the folder it made (relative to the
 # destination folder it holds open; rm never follows a symlink).
 my $UNDO;
-sub bail { print STDERR $_[0], "\n"; if ($UNDO) { chdir($UNDO->[0]) and system("rm", "-rf", "--", "./$UNDO->[1]") } exit($_[1] || 1) }
+sub bail { print STDERR $_[0], "\n"; drop_stage(@$UNDO) if $UNDO; exit($_[1] || 1) }
 $SIG{HUP} = $SIG{TERM} = sub { bail("stopped", 130) };
 sub field { local $/ = "\0"; my $f = <STDIN>; defined $f && chop($f) eq "\0" or bail("short input", 2); $f }
 sub rec { print @_ }
@@ -990,6 +1020,41 @@ sub open_dir_at {
     return $h;
 }
 sub names_in { my $h = shift; rewinddir($h); sort grep { $_ ne '.' && $_ ne '..' } readdir($h) }
+
+# Remove everything inside the folder held by $h, through held handles only.
+sub remove_at {
+    my ($h, $depth) = @_;
+    return if ($depth || 0) > 512;
+    for my $n (names_in($h)) {
+        chdir($h) or return;
+        my @l = lstat($n) or next;
+        if (S_ISDIR($l[2])) {
+            my $c = open_dir_at($h, $n) or next;
+            remove_at($c, ($depth || 0) + 1);
+            closedir($c);
+            chdir($h) or return;
+            rmdir($n);
+        } else {
+            unlink($n);
+        }
+    }
+}
+# Empty the stage held by $S, then remove its name from $D only while that
+# name still is this very folder.
+sub drop_stage {
+    my ($D, $name, $S) = @_;
+    $UNDO = undef;
+    remove_at($S);
+    chdir($D) or return;
+    my @l = lstat($name); my @s = stat($S);
+    rmdir($name) if @l && @s && $l[0] == $s[0] && $l[1] == $s[1];
+}
+# The stage this copy just made: owned by this account, private, empty.
+sub check_stage {
+    my $S = shift;
+    my @s = stat($S) or return 0;
+    return $s[4] == $> && ($s[2] & 07777) == 0700 && !names_in($S);
+}
 sub open_top { my $p = shift; opendir(my $h, $p) or bail("Can't open $p: $!", 3); fd_of($h); $h }
 
 # ---- send: stream the selected items, never following a symlink.
@@ -1046,16 +1111,24 @@ sub cmd_send {
     rec("Z");
 }
 
-# ---- recv: write a stream into a new private folder inside $dst.
+# ---- recv: write a stream into a new private folder inside $dst, then
+# move its items into place, then remove it. The folder is held open from
+# the moment it is made until it is gone, and never looked up by name again.
 sub cmd_recv {
-    my $dst = field(); my $stage = field();
+    my $dst = field(); my $stage = field(); my $mode = field();
     my $D = open_top($dst);
     chdir($D) or bail("Can't enter $dst", 3);
     umask(077);
     mkdir($stage, 0700) or bail("Can't write to $dst ($!)", 3);
-    $UNDO = [$D, $stage];
     my $S = open_dir_at($D, $stage) or bail("The new folder in $dst changed", 6);
-    my @stack = (["", $S]); my @fix;
+    check_stage($S) or bail("The new folder in $dst was swapped for another one", 6);
+    $UNDO = [$D, $stage, $S];
+    my @stack = (["", $S]);
+    my $close = sub {   # a finished folder gets its mode and time
+        my $x = pop(@stack);
+        chdir($x->[2]) or return;
+        chmod(($x->[3] & 0777) | 0700, $x->[4]); utime($x->[5], $x->[5], $x->[4]);
+    };
     while (1) {
         my $t; read(STDIN, $t, 1) == 1 or bail("short input", 2);
         last if $t eq "Z";
@@ -1063,17 +1136,18 @@ sub cmd_recv {
         my ($par, $name) = $p =~ m{^(?:(.*)/)?([^/]+)$} or bail("bad name", 2);
         $par = "" unless defined $par;
         ($name ne '.' && $name ne '..') or bail("bad name", 2);
-        pop(@stack) while @stack > 1 && $stack[-1][0] ne $par;
+        $close->() while @stack > 1 && $stack[-1][0] ne $par;
         $stack[-1][0] eq $par or bail("out of order: $p", 2);
         my $ph = $stack[-1][1];
         chdir($ph) or bail("lost a folder", 6);
         if ($t eq "D") {
-            my $mode = field(); my $mt = field();
+            my $m = field(); my $mt = field();
+            @stack < 512 or bail("folders nested too deeply", 2);
             mkdir($name, 0700) or bail("Can't create $p ($!)", 1);
             my $h = open_dir_at($ph, $name) or bail("$p changed", 6);
-            push @stack, [$p, $h]; push @fix, [$ph, $name, $mode, $mt];
+            push @stack, [$p, $h, $ph, $m, $name, $mt];
         } elsif ($t eq "F") {
-            my $mode = field(); my $mt = field(); my $left = field();
+            my $m = field(); my $mt = field(); my $left = field();
             sysopen(my $f, $name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600) or bail("Can't create $p ($!)", 1);
             while ($left > 0) {
                 my $n = read(STDIN, my $buf, $left < 262144 ? $left : 262144);
@@ -1081,7 +1155,7 @@ sub cmd_recv {
                 defined syswrite($f, $buf) or bail("Can't write $p ($!)", 1);
                 $left -= $n;
             }
-            chmod($mode & 0777, $f); utime($mt, $mt, $f);
+            chmod($m & 0777, $f); utime($mt, $mt, $f);
             close($f) or bail("Can't write $p ($!)", 1);
         } elsif ($t eq "L") {
             my $target = field();
@@ -1090,19 +1164,17 @@ sub cmd_recv {
             bail("bad record", 2);
         }
     }
-    for my $x (reverse @fix) {
-        chdir($x->[0]) or next;
-        chmod(($x->[2] & 0777) | 0700, $x->[1]); utime($x->[3], $x->[3], $x->[1]);
-    }
-    $UNDO = undef;
-    print "ok\0";
+    $close->() while @stack > 1;
+    place_in($S, $D, "", $mode eq "replace");
+    drop_stage($D, $stage, $S);
+    rec("Z");
 }
 
 # ---- place: move the stage's items into $dst. Without replace, an atomic
 # rename that refuses to replace anything; with replace, files and links
 # replace files and links atomically and folders merge into real folders.
 sub place_in {
-    my ($sh, $dh, $rel, $replace) = @_;
+    my ($sh, $dh, $rel, $replace, $depth) = @_;
     for my $n (names_in($sh)) {
         my $r = $rel eq "" ? $n : "$rel/$n";
         chdir($sh) or bail("lost a folder", 6);
@@ -1113,10 +1185,10 @@ sub place_in {
         if (!$replace) { rec("C", "$r\0"); next }
         chdir($dh) or bail("lost a folder", 6);
         my @t = lstat($n) or do { rec("C", "$r\0"); next };
-        if (S_ISDIR($m[2]) && S_ISDIR($t[2])) {
+        if (S_ISDIR($m[2]) && S_ISDIR($t[2]) && ($depth || 0) < 512) {
             my $cs = open_dir_at($sh, $n) or do { rec("E", "$r\0"); next };
             my $cd = open_dir_at($dh, $n) or do { rec("C", "$r\0"); next };
-            place_in($cs, $cd, $r, 1);
+            place_in($cs, $cd, $r, 1, ($depth || 0) + 1);
             closedir($cs); closedir($cd);
         } elsif (!S_ISDIR($m[2]) && !S_ISDIR($t[2])) {
             rename_at(fd_of($sh), $n, fd_of($dh), $n, 0) or rec("C", "$r\0");
@@ -1125,12 +1197,18 @@ sub place_in {
         }
     }
 }
-sub cmd_place {
-    my $dst = field(); my $stage = field(); my $mode = field();
-    my $D = open_top($dst);
-    my $S = open_dir_at($D, $stage) or bail("The copy's folder in $dst changed", 6);
-    place_in($S, $D, "", $mode eq "replace");
-    rec("Z");
+
+# ---- unstage: remove a stage a copy that was cut off left behind. Only a
+# folder this account owns, private, with the stage prefix; removed through
+# held handles.
+sub cmd_unstage {
+    my $dst = field(); my $stage = field();
+    $stage =~ /^\.tailfiles-incoming-[0-9a-f]+$/ or bail("not a stage", 2);
+    opendir(my $D, $dst) or exit 0;
+    my $S = open_dir_at($D, $stage) or exit 0;
+    my @s = stat($S);
+    exit 0 unless @s && $s[4] == $> && ($s[2] & 07777) == 0700;
+    drop_stage($D, $stage, $S);
 }
 
 # ---- rename one item inside a folder without replacing anything.
@@ -1145,7 +1223,7 @@ sub cmd_rename {
 
 my $cmd = field();
 if ($cmd eq "send") { cmd_send() } elsif ($cmd eq "recv") { cmd_recv() }
-elsif ($cmd eq "place") { cmd_place() } elsif ($cmd eq "rename") { cmd_rename() }
+elsif ($cmd eq "unstage") { cmd_unstage() } elsif ($cmd eq "rename") { cmd_rename() }
 else { bail("unknown command", 2) }
 exit 0;
 '''
@@ -1167,19 +1245,22 @@ def agent_fail(rc, err, what):
 
 def run_agent(host, fields, timeout=600):
     """Run the agent for a short command; returns (rc, stdout bytes, stderr lines)."""
-    try:
-        proc = subprocess.run(["ssh"] + ssh_opts(host) + [host, AGENT_CMD], input=agent_input(fields),
-                              capture_output=True, timeout=timeout, env=ENV)
-    except subprocess.TimeoutExpired:
-        return 124, b"", ["Timed out talking to " + host]
-    return proc.returncode, proc.stdout, clean_stderr(proc.stderr.decode("utf-8", "replace"))
+    rc, so, se = run_capped(["ssh"] + ssh_opts(host) + [host, AGENT_CMD], agent_input(fields), timeout,
+                            limit=1 << 20)
+    return rc, so, clean_stderr(se.decode("utf-8", "replace"))
 
 
 def start_agent(host, fields):
-    errf = tempfile.TemporaryFile()
     proc = subprocess.Popen(["ssh"] + ssh_opts(host) + [host, AGENT_CMD], stdin=subprocess.PIPE,
-                            stdout=subprocess.PIPE, stderr=errf, env=ENV, start_new_session=True)
-    proc.errf = errf
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=ENV, start_new_session=True)
+    proc.err_tail = bytearray()
+
+    def drain():  # keep only the end of whatever the helper prints
+        for chunk in iter(lambda: proc.stderr.read1(65536), b""):
+            proc.err_tail += chunk
+            del proc.err_tail[:max(0, len(proc.err_tail) - ERROR_LIMIT)]
+    proc.err_thread = threading.Thread(target=drain, daemon=True)
+    proc.err_thread.start()
     CHILDREN.append(proc)
     try:
         proc.stdin.write(agent_input(fields))
@@ -1195,8 +1276,8 @@ def finish_agent(proc, what):
     except OSError:
         pass
     rc = proc.wait()
-    proc.errf.seek(0)
-    err = clean_stderr(proc.errf.read().decode("utf-8", "replace"))
+    proc.err_thread.join(5)
+    err = clean_stderr(bytes(proc.err_tail).decode("utf-8", "replace"))
     if rc != 0:
         agent_fail(rc, err, what)
     return rc
@@ -1221,9 +1302,17 @@ class Reader:
 
     def field(self):
         while b"\0" not in self.buf:
+            if len(self.buf) > FIELD_LIMIT:
+                fail("The other machine sent a name longer than any real one, so the copy stopped")
             self.more()
         data, _, self.buf = self.buf.partition(b"\0")
         return decode_raw(data)
+
+    def number(self):
+        f = self.field()
+        if not re.fullmatch(r"[0-9]{1,15}", f):
+            fail("The other machine sent a number that doesn't make sense (%r), so the copy stopped" % f[:40])
+        return int(f)
 
     def chunks(self, n):
         while n > 0:
@@ -1236,8 +1325,8 @@ class Reader:
 
 def check_rel(p, roots):
     parts = p.split("/")
-    if parts[0] not in roots or any(x in ("", ".", "..") for x in parts) or CONTROL_RE.search(p):
-        fail("Unexpected item in the copy: %r" % p)
+    if len(parts) > 512 or parts[0] not in roots or any(x in ("", ".", "..") for x in parts) or CONTROL_RE.search(p):
+        fail("Unexpected item in the copy: %r" % p[:200])
 
 
 def agent_records(host, parent, names, prog):
@@ -1248,7 +1337,7 @@ def agent_records(host, parent, names, prog):
     try:
         if r.exact(1) != b"T":
             raise EOFError
-        prog.total = int(r.field())
+        prog.total = r.number()
         while True:
             t = r.exact(1)
             if t == b"Z":
@@ -1259,9 +1348,9 @@ def agent_records(host, parent, names, prog):
             p = r.field()
             check_rel(p, roots)
             if t == b"D":
-                yield ("D", p, int(r.field()) & 0o7777, int(r.field()))
+                yield ("D", p, r.number() & 0o7777, r.number())
             elif t == b"F":
-                mode, mtime, size = int(r.field()) & 0o7777, int(r.field()), int(r.field())
+                mode, mtime, size = r.number() & 0o7777, r.number(), r.number()
                 chunks = r.chunks(size)
                 yield ("F", p, mode, mtime, size, chunks)
                 for _ in chunks:  # whatever the writer didn't take
@@ -1277,11 +1366,14 @@ def agent_records(host, parent, names, prog):
 
 
 class AgentSink:
-    """Writes records into the new folder `stage` inside dst_dir on host."""
+    """One helper process on host makes the new folder `stage` in dst_dir,
+    writes the records into it, moves its items into place and removes it,
+    holding it open throughout."""
 
-    def __init__(self, host, dst_dir, stage):
-        self.host = host
-        self.proc = start_agent(host, ["recv", dst_dir, stage])
+    def __init__(self, host, dst_dir, stage, replace):
+        self.host, self.dst_dir, self.stage = host, dst_dir, stage
+        CLEANUP.append(("remote", self))
+        self.proc = start_agent(host, ["recv", dst_dir, stage, "replace" if replace else "keep"])
 
     def send(self, data):
         try:
@@ -1304,49 +1396,41 @@ class AgentSink:
         elif kind == "L":
             self.send(b"L" + f(p) + f(rec[2]))
 
-    def close(self):
+    def place(self):
+        """Finish: returns (conflicts, errors) as the helper reports them."""
         self.send(b"Z")
         try:
             self.proc.stdin.close()
         except BrokenPipeError:
             pass
-        reply = self.proc.stdout.read()
+        reply = self.proc.stdout.read(16 << 20)
         finish_agent(self.proc, "Couldn't finish the copy on " + self.host)
-        if reply != b"ok\0":
+        conflicts, errors = [], []
+        i = 0
+        while i < len(reply) and reply[i:i + 1] in (b"C", b"E"):
+            j = reply.find(b"\0", i + 1)
+            if j < 0:
+                break
+            name = decode_raw(reply[i + 1:j])
+            if reply[i:i + 1] == b"C":
+                conflicts.append(name)
+            else:
+                errors.append((name, ""))
+            i = j + 1
+        if reply[i:] != b"Z":
             fail("The copy to %s didn't finish" % self.host)
+        return conflicts, errors
 
-
-def agent_place(host, dst_dir, stage, replace):
-    rc, stdout, err = run_agent(host, ["place", dst_dir, stage, "replace" if replace else "keep"])
-    if rc != 0:
-        agent_fail(rc, err, "Couldn't move the copied items into " + dst_dir)
-    conflicts, errors = [], []
-    i = 0
-    while i < len(stdout) and stdout[i:i + 1] != b"Z":
-        kind = stdout[i:i + 1]
-        j = stdout.index(b"\0", i + 1)
-        name = decode_raw(stdout[i + 1:j])
-        (conflicts if kind == b"C" else errors).append(name if kind == b"C" else (name, ""))
-        i = j + 1
-    return conflicts, errors
+    def remove(self):
+        """Only needed if the helper was cut off before removing it itself."""
+        run_agent(self.host, ["unstage", self.dst_dir, self.stage], timeout=300)
 
 
 # ----------------------------------------------------------------- Windows
 
-def windows_home_only(host, folder):
-    """SFTP can't hold a folder open or rename without a chance of replacing
-    something, and a Windows machine has no shell to do it for us. So on
-    Windows, copies only read from and write into folders inside the
-    account's own home folder, which by default only that account (and
-    administrators) can change. `folder` is checked as the server resolves
-    it."""
-    home = sftp_home(host)
-    segs = sftp_batch(host, ["cd " + sftp_quote(folder), "pwd"], what=folder)
-    real = pwd_value(segs[1])
-    hk, rk = guard_key(home, True), guard_key(real, True)
-    if not home or not (rk == hk or rk.startswith(hk.rstrip("/") + "/")):
-        fail("On Windows, Tailnet Files only copies and renames inside your home folder (%s), where no other "
-             "account can change things mid-way. %s is outside it." % (home or "unknown", real))
+WINDOWS_NO = ("Copying to or from Windows machines, and renaming on them, isn't supported. SFTP, the only "
+              "way in, can't hold a folder open or rename without a chance of replacing something, so on "
+              "Windows Tailnet Files only browses, opens files, makes folders and deletes.")
 
 
 def is_windowsish(host):
@@ -1356,27 +1440,11 @@ def is_windowsish(host):
 
 
 STAGE_PREFIX = ".tailfiles-incoming-"
-CLEANUP = []  # (target, folder) this copy created and removes when it ends
-
-
-def new_relay():
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    d = tempfile.mkdtemp(prefix="relay-", dir=CACHE_DIR)
-    CLEANUP.append(("local", d))
-    return d
-
-
-def make_stage(target, dst_dir):
-    """A new, empty folder inside dst_dir on a Windows machine."""
-    path = join_remote(dst_dir, STAGE_PREFIX + os.urandom(8).hex())
-    sftp_batch(check_host(target), ["mkdir " + sftp_quote(path)], what=dst_dir)
-    CLEANUP.append((target, path))
-    return path
+CLEANUP = []  # ("stage", LocalSink) or ("remote", AgentSink) to remove when the copy ends
 
 
 def cleanup():
-    """Remove the stage and relay folders. They hold only what this copy put
-    there (after a successful copy, at most empty folders)."""
+    """Remove the copy's stage. It holds only what this copy put there."""
     global MUTED
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -1398,96 +1466,11 @@ def cleanup():
             except OSError:
                 pass
     while CLEANUP:
-        target, path = CLEANUP.pop()
+        _, owner = CLEANUP.pop()
         try:
-            if target == "local":
-                shutil.rmtree(path)  # never follows symlinks
-            elif probe(target).get("posix"):
-                run_ssh(target, POSIX_DELETE_CMD, timeout=300, input_data=path + "\0")
-            else:
-                cmds = []
-                sftp_walk_delete(target, path, cmds)
-                run_sftp(target, cmds, timeout=300)
+            owner.remove()
         except (OSError, SystemExit):
             pass
-
-
-def lstat_kind(path):
-    try:
-        mode = os.lstat(path).st_mode
-    except OSError:
-        return None
-    return "dir" if stat.S_ISDIR(mode) else "file" if stat.S_ISREG(mode) else "link" if stat.S_ISLNK(mode) else "other"
-
-
-def remote_kinds(host, folder):
-    """{name: dir|file|link|other} for a folder's entries, as the server
-    lstat()s them (a link is reported as a link, not as its target)."""
-    segs = sftp_batch(host, ["cd " + sftp_quote(folder), "pwd", "ls -lan"], what=folder)
-    names = exact_names(host, pwd_value(segs[1])) if probe(host).get("posix") else None
-    entries, skipped = sftp_entries(segs[2], names)
-    if skipped:
-        fail("Some names in %s can't be read safely, so nothing was copied there" % folder)
-    return {e["name"]: {"-": "file", "d": "dir", "l": "link"}.get(e["perm"][0], "other") for e in entries}
-
-
-def sftp_copy(host, verb, items, into):
-    """get or put each (name, path) to into/name with sftp, which copies
-    regular files and folders and skips symlinks and special files inside
-    folders. Returns how many it skipped."""
-    host = check_host(host)
-    cmds = ["progress"]  # batch mode starts with the meter off
-    for name, p in items:
-        dest = (os.path.join(into, name) if verb == "get" else join_remote(into, name))
-        cmds.append("%s -r -p %s %s" % (verb, sftp_quote(p), sftp_quote(dest)))
-    fd, batch = tempfile.mkstemp(prefix="batch-", dir=RUNTIME if os.path.isdir(RUNTIME) else None)
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(encode_raw("\n".join(cmds) + "\n"))
-        rc, err = stream(["sftp"] + ssh_opts(host) + ["-b", batch, host], parse_scp)
-    finally:
-        os.unlink(batch)
-    not_regular = [l for l in err if l.endswith("not a regular file")]
-    if rc != 0:
-        err = [l for l in err if l not in not_regular]
-        fail(error_text(err, "Transfer failed (exit %d)" % rc), classify(err))
-    return len(not_regular)
-
-
-def move_remote_noreplace(host, stage, dst_dir, names):
-    """Windows: move staged items into dst_dir with the plain SFTP rename,
-    which refuses to replace. Returns the names still in the stage."""
-    if not names:
-        return []
-    cmds = ["-rename -l %s %s" % (sftp_quote(join_remote(stage, n)), sftp_quote(join_remote(dst_dir, n)))
-            for n in names]
-    rc, _, err = run_sftp(host, cmds, timeout=300)
-    if rc != 0:
-        fail(error_text(err, "Couldn't move the copied items into " + dst_dir), classify(err))
-    return existing_names(host, stage, names)
-
-
-def plan_remote_merge(host, stage, dst_dir, items, cmds, conflicts):
-    """Windows: queue renames that move staged items into dst_dir, merging
-    folders. `items` are (name, local copy) pairs describing what was
-    staged. A file replaces a file or link (the link itself); a folder
-    merges only into a real folder."""
-    have = remote_kinds(host, dst_dir)
-    for name, lp in items:
-        mine = lstat_kind(lp)
-        if mine not in ("dir", "file"):
-            continue  # sftp didn't copy it
-        s, d = join_remote(stage, name), join_remote(dst_dir, name)
-        theirs = have.get(name)
-        if theirs is None:
-            cmds.append("rename -l %s %s" % (sftp_quote(s), sftp_quote(d)))
-        elif mine == "dir" and theirs == "dir":
-            plan_remote_merge(host, s, d, [(c, os.path.join(lp, c)) for c in sorted(os.listdir(lp))],
-                              cmds, conflicts)
-        elif mine == "file" and theirs in ("file", "link"):
-            cmds.append("rename %s %s" % (sftp_quote(s), sftp_quote(d)))
-        else:
-            conflicts.append(d)
 
 
 # -------------------------------------------------------------------- copy
@@ -1527,10 +1510,8 @@ def cmd_copy(args):
         info = probe(host)
         if not info.get("ok"):
             fail(info.get("error", "Could not connect to " + host), info.get("kind", "other"))
-    if src != "local" and is_windowsish(src):
-        windows_home_only(src, src_dir)
-    if dst != "local" and is_windowsish(dst):
-        windows_home_only(dst, dst_dir)
+    if any(t != "local" and is_windowsish(t) for t in (src, dst)):
+        fail(WINDOWS_NO, "windows")
 
     # Never overwrite without the user's say-so. Asking the filesystem
     # itself means a name that differs only in case counts on a
@@ -1553,77 +1534,25 @@ def cmd_copy(args):
 def run_copy(src, dst, src_dir, dst_dir, paths, names, replace):
     prog = Progress()
     skipped = 0
-
-    # Where the records come from.
-    if src == "local":
-        records = local_records(src_dir, names, prog)
-    elif not is_windowsish(src):
-        records = agent_records(src, src_dir, names, prog)
-    else:
-        # sftp skips symlinks inside folders; the selected items themselves
-        # must be real files or folders (judged from the parent's listing).
-        have = remote_kinds(src, src_dir)
-        kept = [(n, p) for n, p in zip(names, paths) if have.get(n) in ("dir", "file")]
-        skipped += len(paths) - len(kept)
-        relay = new_relay()
-        skipped += sftp_copy(src, "get", kept, relay)
-        records = local_records(relay, [n for n, _ in kept], prog)
-
-    # Where they go: a new folder only this copy writes into.
+    records = (local_records(src_dir, names, prog) if src == "local"
+               else agent_records(src, src_dir, names, prog))
     stage = STAGE_PREFIX + os.urandom(8).hex()
-    dst_win = dst != "local" and is_windowsish(dst)
     if dst == "local":
         dfd = open_top(dst_dir)
-        try:
-            os.mkdir(stage, 0o700, dir_fd=dfd)
-        except OSError as e:
-            fail("Can't write to %s (%s)" % (dst_dir, e.strerror), "denied" if e.errno == errno.EACCES else "other")
-        CLEANUP.append(("local", os.path.join(dst_dir, stage)))
         sink = LocalSink(dfd, stage)
-    elif not dst_win:
-        CLEANUP.append((dst, join_remote(dst_dir, stage)))
-        sink = AgentSink(dst, dst_dir, stage)
     else:
-        relay_out = new_relay()
-        rfd = open_top(relay_out)
-        os.mkdir("items", 0o700, dir_fd=rfd)
-        sink = LocalSink(rfd, "items")
-
+        sink = AgentSink(dst, dst_dir, stage, replace)
     for rec in records:
         if rec[0] == "S":
             skipped += 1
         else:
             sink.write(rec, prog)
-    sink.close()
-
-    conflicts, errors = [], []
     if dst == "local":
-        sfd = open_dir_at(dfd, stage)
-        if sfd is None:
-            fail("The copy's folder in %s changed, so nothing was moved into place" % dst_dir)
-        place_local(sfd, dfd, "", replace, conflicts, errors)
-    elif not dst_win:
-        conflicts, errors = agent_place(dst, dst_dir, stage, replace)
+        sink.close()
+        conflicts, errors = [], []
+        place_local(sink.sfd, dfd, "", replace, conflicts, errors)
     else:
-        items_dir = os.path.join(relay_out, "items")
-        tree = []
-        for n in sorted(os.listdir(items_dir)):
-            if lstat_kind(os.path.join(items_dir, n)) in ("dir", "file"):
-                tree.append((n, os.path.join(items_dir, n)))
-            else:
-                skipped += 1  # sftp would follow a top-level link
-        win_stage = make_stage(dst, dst_dir)
-        skipped += sftp_copy(dst, "put", tree, win_stage)
-        if not replace:
-            left = move_remote_noreplace(check_host(dst), win_stage, dst_dir, [n for n, _ in tree])
-            conflicts = existing_names(dst, dst_dir, left)
-            errors = [(n, "") for n in left if n not in conflicts]
-        else:
-            cmds = []
-            plan_remote_merge(check_host(dst), win_stage, dst_dir, tree, cmds, conflicts)
-            rc, _, err = run_sftp(check_host(dst), cmds, timeout=300)
-            if rc != 0:
-                fail(error_text(err, "Couldn't move the copied items into " + dst_dir), classify(err))
+        conflicts, errors = sink.place()
 
     if errors:
         fail("Couldn't move %s into %s without a chance of replacing something (that disk can't rename "
@@ -1710,15 +1639,7 @@ def cmd_rename(target, old, new):
         if rc != 0:
             agent_fail(rc, err, "Could not rename")
     else:
-        host = check_host(target)
-        windows_home_only(host, op)
-        if existing_names(target, op, [nn]):
-            fail("Something named that already exists")
-        # -l: the plain SFTP rename, which fails if the new name exists. The
-        # default posix-rename extension would silently replace it.
-        rc, _, err = run_sftp(host, ["rename -l " + sftp_quote(old) + " " + sftp_quote(new)])
-        if rc != 0:
-            fail(error_text(err, "Could not rename"), classify(err))
+        fail(WINDOWS_NO, "windows")
     out({"ok": True})
 
 
@@ -1877,9 +1798,9 @@ def cmd_open(target, path):
         elif os.path.lexists(dest):
             os.remove(dest)
         cmd = ["scp", "-p"] + ssh_opts(host) + ["--", host + ":" + glob_escape(path), dest]
-        proc = subprocess.run(cmd, capture_output=True, text=True, env=ENV, stdin=subprocess.DEVNULL, timeout=600)
-        if proc.returncode != 0:
-            err = clean_stderr(proc.stderr)
+        rc, _, se = run_capped(cmd, timeout=600, limit=1 << 20)
+        if rc != 0:
+            err = clean_stderr(se.decode("utf-8", "replace"))
             fail(error_text(err, "Could not fetch file"), classify(err))
         # Downloaded files are opened by their default app, never run.
         for root_dir, _, files in (os.walk(dest) if os.path.isdir(dest) else [("", [], [dest])]):

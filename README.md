@@ -99,9 +99,10 @@ Each machine needs an SSH server you can sign in to without a password prompt:
 
 - **Linux / Raspberry Pi:** `sshd` running.
 - **macOS:** System Settings › General › Sharing › Remote Login.
-- **Windows:** the built-in "OpenSSH Server" optional feature. Browsing and
-  copying use SFTP. On Windows, copies and renames only happen inside your
-  home folder (see below).
+- **Windows:** the built-in "OpenSSH Server" optional feature. Windows
+  machines are reached over SFTP and can be browsed, opened from, and have
+  folders made and items deleted. Copying to or from them, and renaming on
+  them, isn't available (see below).
 
 Then use one of these to sign in:
 
@@ -147,15 +148,23 @@ setting is saved in `~/.config/tailfiles/hosts.json`. Settings in
   never followed, whether selected or inside a folder. Sockets, devices and
   pipes are skipped, and the finished copy says how many.
 - Writing: a copy goes into a new hidden folder (`.tailfiles-incoming-…`)
-  inside the destination, created exclusively and written only by that
-  copy (every file `O_CREAT|O_EXCL|O_NOFOLLOW`). Each item is then moved
+  inside the destination, created exclusively, checked to be the private,
+  empty folder this copy just made, and then held open until it is removed.
+  It is never looked up by name again, so a folder someone else renames in
+  under that name in a shared destination is never written to or moved
+  from. Every file is created `O_CREAT|O_EXCL|O_NOFOLLOW`. Each item is then moved
   into place with a rename that refuses to replace anything, relative to
   the folders it holds open: `renameat2(RENAME_NOREPLACE)` on Linux,
   `renameatx_np(RENAME_EXCL)` on macOS. If the disk can't refuse
   atomically, the item isn't moved and the copy fails. A name that appears
   during the copy, or that differs only in case on a case-insensitive disk,
-  is never overwritten. The hidden folder is removed when the copy ends,
-  including when it fails or is cancelled.
+  is never overwritten. The hidden folder is emptied through the handle and
+  removed when the copy ends (including when it fails or is cancelled), and
+  its name only while it still is that folder.
+- Nothing another machine sends can make the helper use unbounded memory:
+  names, link targets and numbers in a copy are capped, folder nesting is
+  capped at 512, replies to other commands at 64 MB, and only the end of
+  any error output is kept.
 - With Replace, files and symlinks replace files and symlinks with one
   atomic rename (a symlink is replaced itself, never written through), and
   folders merge only into real folders, each held open (and checked to be
@@ -163,11 +172,9 @@ setting is saved in `~/.config/tailfiles/hosts.json`. Settings in
   folder or the other way round.
 - Rename uses the same atomic no-replace rename, here and on Linux and
   macOS machines.
-- Windows: SFTP can't hold a folder open or rename atomically, and Windows
-  has no shell to do it for us, so copies to or from a Windows machine, and
-  renames on it, only happen inside the account's home folder (as the
-  server resolves it). By default only that account and administrators can
-  change things there. Copies use sftp, which skips symlinks.
+- Windows: SFTP can't hold a folder open or rename without a chance of
+  replacing something, and Windows has no shell to do it for us, so copying
+  to or from a Windows machine and renaming on it are refused.
 - The account is fixed per machine for a whole run, so both sides of a copy
   between two panes on one machine must use the same account; the window
   and the helper refuse otherwise.
