@@ -25,8 +25,8 @@ Then click the folder icon in the bar.
 - Python 3, standard library only
 - `xdg-open` (xdg-utils) to open files in their default app
 - `gio` (glib2) to move local deletes to the Trash
-- Optional: `rsync` on both ends for resumable copies, `notify-send` for
-  "transfer finished" notifications
+- Optional: `rsync` on both ends for resumable copies (3.2.4 or newer on this
+  computer), `notify-send` for "transfer finished" notifications
 
 The plugin runs as your user, needs no root access, and does not edit your
 Hyprland config, keybindings or `~/.ssh/config`. It writes only:
@@ -139,16 +139,24 @@ setting is saved in `~/.config/tailfiles/hosts.json`. Settings in
   through this computer.
 - Paths are always handled literally, even names with `*`, `?`, `[`, quotes
   or spaces. SFTP commands escape every special character the way sftp(1)
-  documents, and scp source paths are escaped so they can't glob. rsync
-  leaves wildcards for the far end to expand, so a copy that involves such a
-  remote name goes through scp instead. Names containing control characters
-  are refused.
+  documents, and scp source paths are escaped so they can't glob. rsync is
+  used only when this computer has rsync 3.2.4 or newer, always with
+  `--no-old-args`, so remote paths are escaped for the remote shell. rsync
+  still leaves wildcards (`* ? [ ] \ ^ ~`) for the far end to expand, so a
+  copy that involves such a remote name goes through scp instead. Names
+  containing control characters are refused.
 - Deleting on this computer only ever moves things to the Trash (`gio trash`).
   If that fails, the item stays where it is; there is no permanent fallback.
   Deleting on another machine is permanent. The helper refuses to delete `/`,
   a drive root, that machine's home folder or anything containing it, or any
   path with `.` or `..` in it. It looks up the home folder fresh before each
-  delete (on Windows, from where SFTP starts) and deletes nothing if it can't. On
+  delete (on Windows, from where SFTP starts) and deletes nothing if it can't.
+  It checks each path both as written and with its parent folders' symlinks
+  resolved by the machine that holds it, then deletes the resolved path. A
+  selected symlink is removed itself, never its target.
+- A New folder, Rename or Delete dialog acts only on the machine and folder
+  it was opened for. If that side changes before you confirm, nothing
+  happens. On
   Linux and macOS the paths go to `xargs -0 rm -rf --` on standard input, so
   no remote shell parses them. On Windows it walks the folder over SFTP,
   removes a selected symlink without following it, and builds every command

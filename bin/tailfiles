@@ -50,6 +50,10 @@ POSIX_SYSTEMS = {"Linux", "Darwin", "FreeBSD", "OpenBSD", "NetBSD", "DragonFly",
 HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
 USER_RE = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._@\\-]*$")
 ENV = dict(os.environ, LC_ALL="C", LANG="C")
+# These switch rsync to argument modes where remote paths reach the remote
+# shell unescaped (old args) or are globbed by the far rsync (protect args).
+for _var in ("RSYNC_OLD_ARGS", "RSYNC_PROTECT_ARGS"):
+    ENV.pop(_var, None)
 
 
 def out(obj):
@@ -390,7 +394,21 @@ def remote_spec(target, path):
     return path if target == "local" else target + ":" + path
 
 
-RSYNC_WILDCARDS = re.compile(r"[*?\[\]\\]")
+# Characters rsync's argument escaping leaves for the remote side, where a
+# shell (zsh extended globbing included) or rsync's own glob may read them.
+RSYNC_WILDCARDS = re.compile(r"[*?\[\]\\^~]")
+
+
+def rsync_escapes_args():
+    """rsync 3.2.4+ escapes remote paths for the remote shell and knows
+    --no-old-args. Older clients pass them through unescaped."""
+    try:
+        first = subprocess.run(["rsync", "--version"], capture_output=True, text=True,
+                               timeout=10, env=ENV).stdout.splitlines()[0]
+    except (OSError, IndexError, subprocess.TimeoutExpired):
+        return False
+    m = re.search(r"version\s+(\d+)\.(\d+)\.(\d+)", first)
+    return bool(m) and "openrsync" not in first and tuple(map(int, m.groups())) >= (3, 2, 4)
 
 
 def stream(cmd, parse, use_pty):
@@ -471,7 +489,7 @@ def cmd_copy(args):
     signal.signal(signal.SIGINT, kill_child)
 
     remote = [t for t in (src, dst) if t != "local"]
-    use_rsync = shutil.which("rsync") is not None
+    use_rsync = shutil.which("rsync") is not None and rsync_escapes_args()
     for host in remote:
         info = probe(host)
         if not info.get("ok"):
@@ -496,7 +514,7 @@ def cmd_copy(args):
     out({"event": "start", "engine": "rsync" if use_rsync else "scp", "count": len(paths)})
     if use_rsync:
         host = remote[0] if remote else None
-        cmd = ["rsync", "-a", "-h", "--partial", "--info=progress2", "--no-inc-recursive", "--outbuf=L"]
+        cmd = ["rsync", "--no-old-args", "-a", "-h", "--partial", "--info=progress2", "--no-inc-recursive", "--outbuf=L"]
         if host:
             cmd += ["-e", "ssh " + " ".join(shlex.quote(o) for o in ssh_opts(host))]
         cmd += ["--"] + [remote_spec(src, p.rstrip("/") or "/") for p in paths]
@@ -538,17 +556,16 @@ def guard_key(path, windows):
     return p.rstrip("/") or "/"
 
 
-def guard_delete(path, home, windows=False):
+def guard_delete(path, homes, windows=False):
     """Refuse anything but a plain absolute path that is not a root, a
-    drive, the home folder of the machine it is on, or an ancestor of that
-    home. Without a known home nothing is deleted."""
+    drive, a home folder of the machine it is on (as spelled and as
+    resolved), or an ancestor of one. Without a known home nothing is
+    deleted. Callers check both the path as given and its resolved form."""
     check_path(path)
-    if not home:
+    homes = {guard_key(h, windows) for h in homes if h}
+    if not homes:
         fail("Refusing to delete: couldn't determine the home folder on that machine")
     norm = guard_key(path, windows)
-    homes = {guard_key(home, windows)}
-    if not windows:
-        homes.add(guard_key(HOME, False))
     if not norm.startswith("/") \
             or any(p in (".", "..") for p in norm.split("/")) \
             or norm == "/" or re.match(r"^/[a-z]:$", norm, re.I) \
@@ -617,14 +634,41 @@ def sftp_walk_delete(host, path, cmds, top=True):
     cmds.append("rmdir " + sftp_quote(path))
 
 
+def resolve_remote_parents(host, paths):
+    """Each path with its parent folder resolved by the server (sftp `cd`
+    uses the server's realpath, following every symlink) and its own name
+    kept: rm and the SFTP walk remove a link itself, never its target."""
+    cmds = []
+    names = []
+    for p in paths:
+        parent, _, name = p.rstrip("/").rpartition("/")
+        cmds += ["cd " + sftp_quote(parent or "/"), "pwd"]
+        names.append(name)
+    rc, stdout, err = run_sftp(host, cmds)
+    seen = [l[len("Remote working directory: "):].strip() for l in stdout.splitlines()
+            if l.startswith("Remote working directory: ")]
+    if rc != 0 or len(seen) != len(paths):
+        fail(error_text(err, "Couldn't resolve the folders to delete from; nothing was deleted"), classify(err))
+    return [join_remote(seen[i], names[i]) for i in range(len(paths))]
+
+
 def cmd_delete(target, paths):
     # No trailing slash: `rm -rf link/` would act on the link's target.
     paths = [p.rstrip("/") or "/" for p in paths]
     if target == "local":
         # This computer only ever uses the Trash. If moving something there
         # fails, stop: never fall back to deleting it permanently.
+        homes = [HOME, os.path.realpath(HOME)]
+        resolved = []
         for p in paths:
-            guard_delete(p, HOME)
+            guard_delete(p, homes)
+            # Resolve symlinks in the parent folders, not the item itself:
+            # gio trash moves a link, never its target.
+            parent, name = os.path.split(p)
+            real = os.path.join(os.path.realpath(parent or "/"), name)
+            guard_delete(real, homes)
+            resolved.append(real)
+        paths = resolved
         trash = shutil.which("gio")
         if not trash:
             fail("Can't move to the Trash: gio (glib2) is not installed. Nothing was deleted.")
@@ -642,8 +686,18 @@ def cmd_delete(target, paths):
     info = probe(host, use_cache=False)  # fresh: the guard needs this machine's home
     if not info.get("ok"):
         fail(info.get("error", "Could not connect"), info.get("kind", "other"))
+    windows = not info.get("posix")
+    # The home as the shell reports it and as the server resolves it.
+    homes = [info.get("home"), sftp_home(host)] + ([] if windows else [HOME])
+    if not info.get("home"):
+        homes = []  # fail closed: the probe must have found the home
     for p in paths:
-        guard_delete(p, info.get("home"), windows=not info.get("posix"))
+        guard_delete(p, homes, windows)
+    # Check, and then delete, the paths as the remote filesystem resolves
+    # them, so a symlinked parent can't hide a home folder or an ancestor.
+    paths = resolve_remote_parents(host, paths)
+    for p in paths:
+        guard_delete(p, homes, windows)
     if info.get("posix"):
         # The command is fixed; the paths travel NUL-separated on stdin, so
         # no shell (whatever the login shell is) ever parses or globs them.

@@ -63,6 +63,11 @@ Item {
         leftPane.setTarget("local")
         rightPane.setTarget(payload.host ? String(payload.host) : root.defaultRemote())
       } else if (payload.host) {
+        if (String(payload.host) !== rightPane.target && dialogContext && dialogContext.pane === rightPane
+            && (dialogKind === "mkdir" || dialogKind === "rename" || dialogKind === "delete")) {
+          closeDialog()
+          setStatus(strings.t("status.dialogStale"), true)
+        }
         rightPane.setTarget(String(payload.host))
       }
     })
@@ -246,14 +251,14 @@ Item {
   function promptMkdir() {
     var v = activeView
     if (v.blocked || v.path === "") return
-    openDialog("mkdir", strings.t("dialog.mkdirTitle"), strings.t("dialog.mkdirBody").arg(v.path), { pane: v }, "")
+    openDialog("mkdir", strings.t("dialog.mkdirTitle"), strings.t("dialog.mkdirBody").arg(v.path), { pane: v, target: v.target, path: v.path }, "")
   }
 
   function promptRename() {
     var v = activeView
     var row = v.currentRow()
     if (!row || row.type === "up" || v.blocked) return
-    openDialog("rename", strings.t("dialog.renameTitle"), "", { pane: v, name: row.name }, row.name)
+    openDialog("rename", strings.t("dialog.renameTitle"), "", { pane: v, target: v.target, path: v.path, name: row.name }, row.name)
   }
 
   function promptDelete() {
@@ -262,7 +267,7 @@ Item {
     if (items.length === 0 || v.blocked) return
     var what = items.length === 1 ? items[0].name : strings.tn("transfer.items", items.length).arg(Commons.I18n.formatNumber(items.length))
     var body = v.isLocal ? strings.t("dialog.deleteLocalBody") : strings.t("dialog.deleteRemoteBody").arg(v.machine.name)
-    openDialog("delete", strings.t("dialog.deleteTitle").arg(what), body, { pane: v, items: items }, "")
+    openDialog("delete", strings.t("dialog.deleteTitle").arg(what), body, { pane: v, target: v.target, path: v.path, items: items }, "")
   }
 
   function promptUser(host) {
@@ -311,9 +316,17 @@ Item {
     }
     closeDialog()
     if (!ctx) return
+    // A dialog acts on the machine and folder it was opened for. If the pane
+    // has moved since (a summon can retarget it), do nothing.
+    if (kind === "mkdir" || kind === "rename" || kind === "delete") {
+      if (ctx.pane.target !== ctx.target || ctx.pane.path !== ctx.path) {
+        setStatus(strings.t("status.dialogStale"), true)
+        return
+      }
+    }
     if (kind === "mkdir") {
       var p = ctx.pane
-      backend.run(["mkdir", p.target, p.join(p.path, value)], function(res) {
+      backend.run(["mkdir", ctx.target, p.join(ctx.path, value)], function(res) {
         if (!res.ok) { root.setStatus(String(res.error), true); return }
         p.selectAfterLoad = value
         p.refresh()
@@ -321,7 +334,7 @@ Item {
     } else if (kind === "rename") {
       var rp = ctx.pane
       if (value === ctx.name) return
-      backend.run(["rename", rp.target, rp.join(rp.path, ctx.name), rp.join(rp.path, value)], function(res) {
+      backend.run(["rename", ctx.target, rp.join(ctx.path, ctx.name), rp.join(ctx.path, value)], function(res) {
         if (!res.ok) { root.setStatus(String(res.error), true); return }
         rp.selectAfterLoad = value
         rp.refresh()
@@ -331,7 +344,7 @@ Item {
       var paths = []
       for (var i = 0; i < ctx.items.length; i++) paths.push(ctx.items[i].path)
       setStatus(strings.t("status.deleting"), false)
-      backend.run(["delete", dp.target].concat(paths), function(res) {
+      backend.run(["delete", ctx.target].concat(paths), function(res) {
         if (!res.ok) {
           root.setStatus(String(res.error), true)
           // Some items may already be gone (trashed before a failure).

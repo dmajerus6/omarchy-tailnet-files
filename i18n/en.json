@@ -61,6 +61,7 @@
   "status.badName": "That name can't be used",
   "status.setupKey": "Finish setting up the key for %1 in the terminal, then press Retry",
   "status.deleting": "Deleting…",
+  "status.dialogStale": "That side switched to another machine or folder, so nothing was changed",
   "status.deleted": "Deleted",
   "status.trashed": "Moved to Trash",
   "notice.fetching": "Downloading %1 to open it…",

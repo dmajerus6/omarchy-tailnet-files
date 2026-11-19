@@ -245,6 +245,12 @@ Rectangle {
 
   // ------------------------------------------------------------ marks
 
+  // Marks are keyed "m:" + name and tested with === true, so a file called
+  // "constructor", "toString" or "__proto__" can never read an inherited
+  // property as a mark.
+  function markKey(name) { return "m:" + name }
+  function isMarked(name) { return marked[markKey(name)] === true }
+
   function clearMarks() {
     marked = ({})
     markedCount = 0
@@ -255,7 +261,7 @@ Rectangle {
     var count = 0
     var bytes = 0
     for (var i = 0; i < entries.length; i++) {
-      if (marked[entries[i].name]) { count++; bytes += entries[i].size || 0 }
+      if (isMarked(entries[i].name)) { count++; bytes += entries[i].size || 0 }
     }
     markedCount = count
     markedBytes = bytes
@@ -264,9 +270,9 @@ Rectangle {
   function setMark(name, on) {
     if (name === "..") return
     var next = ({})
-    for (var k in marked) if (marked[k]) next[k] = true
-    if (on) next[name] = true
-    else delete next[name]
+    for (var k in marked) if (marked[k] === true) next[k] = true
+    if (on) next[markKey(name)] = true
+    else delete next[markKey(name)]
     marked = next
     recountMarks()
   }
@@ -274,23 +280,23 @@ Rectangle {
   function toggleMarkAtCursor(advance) {
     var row = currentRow()
     if (!row || row.type === "up") { if (advance) moveCursor(1); return }
-    setMark(row.name, !marked[row.name])
+    setMark(row.name, !isMarked(row.name))
     if (advance) moveCursor(1)
   }
 
   function markAll() {
     var next = ({})
     var allMarked = true
-    for (var i = 0; i < rows.length; i++) if (rows[i].type !== "up" && !marked[rows[i].name]) allMarked = false
-    if (!allMarked) for (var j = 0; j < rows.length; j++) if (rows[j].type !== "up") next[rows[j].name] = true
+    for (var i = 0; i < rows.length; i++) if (rows[i].type !== "up" && !isMarked(rows[i].name)) allMarked = false
+    if (!allMarked) for (var j = 0; j < rows.length; j++) if (rows[j].type !== "up") next[markKey(rows[j].name)] = true
     marked = next
     recountMarks()
   }
 
   function markRange(from, to) {
     var next = ({})
-    for (var k in marked) if (marked[k]) next[k] = true
-    for (var i = Math.min(from, to); i <= Math.max(from, to); i++) if (rows[i] && rows[i].type !== "up") next[rows[i].name] = true
+    for (var k in marked) if (marked[k] === true) next[k] = true
+    for (var i = Math.min(from, to); i <= Math.max(from, to); i++) if (rows[i] && rows[i].type !== "up") next[markKey(rows[i].name)] = true
     marked = next
     recountMarks()
   }
@@ -301,7 +307,7 @@ Rectangle {
     if (markedCount > 0) {
       for (var i = 0; i < entries.length; i++) {
         var e = entries[i]
-        if (marked[e.name]) out.push({ name: e.name, type: e.type, path: join(path, e.name) })
+        if (isMarked(e.name)) out.push({ name: e.name, type: e.type, path: join(path, e.name) })
       }
       return out
     }
@@ -608,7 +614,7 @@ Rectangle {
       required property var modelData
       required property int index
       readonly property bool isCursor: index === pane.cursor
-      readonly property bool isMarked: pane.marked[modelData.name] === true
+      readonly property bool isMarked: pane.marked[pane.markKey(modelData.name)] === true
 
       width: list.width
       height: pane.rowHeight
