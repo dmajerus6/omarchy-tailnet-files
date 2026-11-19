@@ -192,29 +192,61 @@ def glob_escape(path):
     return re.sub(r"([\\*?\[])", r"\\\1", path)
 
 
+# Remote output is handled as exact bytes: no newline translation (text
+# mode turns \r into \n) and no trimming, since spaces at either end and
+# odd characters are valid in file and folder names. Undecodable bytes
+# survive the round trip through surrogateescape.
+def encode_raw(text):
+    return text.encode("utf-8", "surrogateescape")
+
+
+def decode_raw(data):
+    return (data or b"").decode("utf-8", "surrogateescape")
+
+
+def lines_of(text):
+    """Split remote output on \\n only. str.splitlines() would also split
+    on \\r, \\x1c-\\x1e, \\x85, U+2028 and U+2029, which can occur in names."""
+    return text.split("\n")
+
+
+PWD_PREFIX = "Remote working directory: "
+
+
+def first_pwd(text):
+    """The folder printed by the first sftp `pwd`, exactly as printed."""
+    for line in lines_of(text):
+        if line.startswith(PWD_PREFIX):
+            return line[len(PWD_PREFIX):]
+    return ""
+
+
+def all_pwds(text):
+    return [l[len(PWD_PREFIX):] for l in lines_of(text) if l.startswith(PWD_PREFIX)]
+
+
 def run_sftp(host, commands, timeout=60):
     """Run sftp batch commands; return (rc, stdout, stderr_lines)."""
     # No -q: it would also silence ssh's own "Permission denied" diagnostics.
     cmd = ["sftp"] + ssh_opts(host) + ["-b", "-", host]
     try:
-        proc = subprocess.run(cmd, input="\n".join(commands) + "\n", capture_output=True,
-                              text=True, timeout=timeout, env=ENV)
+        proc = subprocess.run(cmd, input=encode_raw("\n".join(commands) + "\n"), capture_output=True,
+                              timeout=timeout, env=ENV)
     except subprocess.TimeoutExpired:
         return 124, "", ["Timed out talking to " + host]
-    return proc.returncode, proc.stdout, clean_stderr(proc.stderr)
+    return proc.returncode, decode_raw(proc.stdout), clean_stderr(proc.stderr.decode("utf-8", "replace"))
 
 
 def run_ssh(host, remote_cmd, timeout=30, input_data=None):
     """remote_cmd goes through the remote login shell, so it must be a
     fixed string; pass anything user-controlled as input_data on stdin."""
     cmd = ["ssh"] + ssh_opts(host) + [host, remote_cmd]
-    stdin = {"input": input_data} if input_data is not None else {"stdin": subprocess.DEVNULL}
+    stdin = {"input": encode_raw(input_data)} if input_data is not None else {"stdin": subprocess.DEVNULL}
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                              env=ENV, **stdin)
+        proc = subprocess.run(cmd, capture_output=True, timeout=timeout, env=ENV, **stdin)
     except subprocess.TimeoutExpired:
         return 124, "", ["Timed out talking to " + host]
-    return proc.returncode, proc.stdout, clean_stderr(proc.stderr)
+    return proc.returncode, decode_raw(proc.stdout), clean_stderr(proc.stderr.decode("utf-8", "replace"))
 
 
 def sftp_home(host):
@@ -222,10 +254,7 @@ def sftp_home(host):
     rc, stdout, _ = run_sftp(host, ["pwd"])
     if rc != 0:
         return ""
-    for line in stdout.splitlines():
-        if line.startswith("Remote working directory: "):
-            return line[len("Remote working directory: "):].strip()
-    return ""
+    return first_pwd(stdout)
 
 
 def probe(host, use_cache=True):
@@ -241,10 +270,11 @@ def probe(host, use_cache=True):
     if rc == 255:
         kind = classify(err)
         return {"ok": False, "kind": kind, "error": error_text(err, "Could not connect to " + host)}
-    lines = [l.strip() for l in stdout.splitlines()]
+    lines = lines_of(stdout)
     info = {"ok": True, "posix": False, "rsync": False, "system": "", "home": ""}
-    if len(lines) >= 4 and lines[0] == "__TF__" and lines[1] in POSIX_SYSTEMS:
-        info.update(posix=True, system=lines[1], rsync=lines[2] == "rsync=yes", home=lines[3])
+    if len(lines) >= 4 and lines[0].strip() == "__TF__" and lines[1].strip() in POSIX_SYSTEMS:
+        # $HOME is printed with printf "%s\n": take it exactly, untrimmed.
+        info.update(posix=True, system=lines[1].strip(), rsync=lines[2].strip() == "rsync=yes", home=lines[3])
     else:
         # Windows OpenSSH: no POSIX shell, but sftp starts in the profile
         # folder, e.g. /C:/Users/name.
@@ -313,27 +343,56 @@ def list_local(path):
     return {"ok": True, "path": path, "entries": entries, "home": HOME}
 
 
-def sftp_entries(stdout):
-    entries = []
-    pwd = ""
-    for line in stdout.splitlines():
-        if line.startswith("Remote working directory: "):
-            pwd = line[len("Remote working directory: "):].strip()
-            continue
+def sftp_entries(stdout, names=None):
+    """Parse `pwd` + `ls -lan` output from one sftp batch.
+
+    The folder is the first `pwd` line, which comes before the listing, so a
+    file name can't forge it. Entries are read only after the `ls` echo.
+    Nothing is trimmed. With `names` (the folder's exact names from another
+    source) an entry is kept only if its name is one of them. A name that
+    appears twice is always left out. Returns (pwd, entries, skipped)."""
+    lines = lines_of(stdout)
+    pwd = first_pwd(stdout)
+    start = next((i for i, l in enumerate(lines) if l.startswith("sftp> ls")), -1)
+    parsed = []
+    skipped = 0
+    for line in lines[start + 1:] if start >= 0 else []:
         m = LONG_RE.match(line)
         if not m:
             continue
-        perm, size, mon, day, rest, name = m.group(1), int(m.group(5)), m.group(6), m.group(7), m.group(8), m.group(9)
-        target = ""
+        perm, size, mon, day, rest, text = m.group(1), int(m.group(5)), m.group(6), m.group(7), m.group(8), m.group(9)
         kind = {"d": "dir", "l": "link"}.get(perm[0], "file")
-        if kind == "link" and " -> " in name:
-            name, target = name.split(" -> ", 1)
-        if name in (".", ".."):
+        name, target = text, ""
+        if text in (".", ".."):
             continue
-        entries.append({"name": name, "type": kind, "link": kind == "link", "target": target,
-                        "size": size if kind == "file" else 0,
-                        "mtime": parse_mtime(mon, day, rest), "perm": perm})
-    return pwd, entries
+        # `ls -lan` is formatted by the sftp client, which never appends a
+        # link's target, so the text after the date is the whole name, even
+        # for a link literally called "a -> b".
+        if names is not None and name not in names:
+            skipped += 1
+            continue
+        parsed.append({"name": name, "type": kind, "link": kind == "link", "target": target,
+                       "size": size if kind == "file" else 0,
+                       "mtime": parse_mtime(mon, day, rest), "perm": perm})
+    counts = {}
+    for e in parsed:
+        counts[e["name"]] = counts.get(e["name"], 0) + 1
+    entries = [e for e in parsed if counts[e["name"]] == 1]
+    skipped += len(parsed) - len(entries)
+    return pwd, entries, skipped
+
+
+# Exact names in a folder on a POSIX machine, NUL-separated. The command is
+# fixed; the folder arrives on stdin.
+NAMES_CMD = "sh -c 'IFS= read -r d && cd -- \"$d\" && exec find . -mindepth 1 -maxdepth 1 -print0'"
+
+
+def exact_names(host, folder):
+    check_path(folder)
+    rc, stdout, err = run_ssh(host, NAMES_CMD, input_data=folder + "\n")
+    if rc != 0:
+        fail(error_text(err, "Couldn't read the exact names in " + folder), classify(err))
+    return {n[2:] if n.startswith("./") else n for n in stdout.split("\0") if n}
 
 
 def list_remote(host, path):
@@ -344,24 +403,32 @@ def list_remote(host, path):
     rc, stdout, err = run_sftp(host, cmds)
     if rc != 0:
         fail(error_text(err, "Could not list " + (path or "home") + " on " + host), classify(err))
-    pwd, entries = sftp_entries(stdout)
+    pwd = first_pwd(stdout)
+    if not pwd:
+        fail("Could not tell which folder " + host + " listed")
+    # sftp's listing is text, so a name with a line break in it could read
+    # as a different name. On POSIX machines, check every name against the
+    # folder's exact names; Windows names can't contain line breaks.
+    names = exact_names(host, pwd) if probe(host).get("posix") else None
+    pwd, entries, skipped = sftp_entries(stdout, names)
     # Links whose target is a folder should open like folders. Ask the server
     # in one round trip which of them `cd` into.
     # Each check prints one working directory: unchanged means the cd failed.
     links = [e for e in entries if e["type"] == "link"][:200]
-    if links and pwd:
+    if links:
         checks = ["cd " + sftp_quote(pwd)]
         for e in links:
             checks += ["-cd " + sftp_quote(join_remote(pwd, e["name"])), "pwd", "cd " + sftp_quote(pwd)]
         _, so2, _ = run_sftp(host, checks)
-        seen = [l[len("Remote working directory: "):].strip() for l in so2.splitlines()
-                if l.startswith("Remote working directory: ")]
+        seen = all_pwds(so2)
+        if len(seen) != len(links):
+            seen = [pwd] * len(links)  # can't tell reliably: show them as files
         for i, e in enumerate(links):
-            e["type"] = "dir" if i < len(seen) and seen[i] != pwd else "file"
+            e["type"] = "dir" if seen[i] != pwd else "file"
     for e in entries:
         if e["type"] == "link":
             e["type"] = "file"
-    return {"ok": True, "path": pwd or path, "entries": entries}
+    return {"ok": True, "path": pwd, "entries": entries, "skipped": skipped}
 
 
 def join_remote(base, name):
@@ -624,7 +691,7 @@ def sftp_walk_delete(host, path, cmds, top=True):
     if rc != 0:
         cmds.append("rm " + sftp_quote(path))
         return
-    _, entries = sftp_entries(stdout)
+    _, entries, _ = sftp_entries(stdout)
     for e in entries:
         child_path = join_remote(path, e["name"])
         if e["type"] == "dir":
@@ -645,8 +712,7 @@ def resolve_remote_parents(host, paths):
         cmds += ["cd " + sftp_quote(parent or "/"), "pwd"]
         names.append(name)
     rc, stdout, err = run_sftp(host, cmds)
-    seen = [l[len("Remote working directory: "):].strip() for l in stdout.splitlines()
-            if l.startswith("Remote working directory: ")]
+    seen = all_pwds(stdout)
     if rc != 0 or len(seen) != len(paths):
         fail(error_text(err, "Couldn't resolve the folders to delete from; nothing was deleted"), classify(err))
     return [join_remote(seen[i], names[i]) for i in range(len(paths))]

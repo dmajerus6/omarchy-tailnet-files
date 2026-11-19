@@ -137,6 +137,11 @@ setting is saved in `~/.config/tailfiles/hosts.json`. Settings in
   interrupted copy picks up where it stopped. Otherwise they use `scp -r -p`.
   Copies between two remote machines use `scp -3`, which routes the data
   through this computer.
+- Remote folder listings come from sftp's text output, read exactly: no
+  trimming, and lines split only at `\n`. On Linux and macOS every listed
+  name is also checked against the folder's exact names (a fixed
+  `find -print0`). A name sftp can't print faithfully, such as one with a
+  line break or a non-printable character, is left out rather than guessed.
 - Paths are always handled literally, even names with `*`, `?`, `[`, quotes
   or spaces. SFTP commands escape every special character the way sftp(1)
   documents, and scp source paths are escaped so they can't glob. rsync is
