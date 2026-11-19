@@ -69,7 +69,7 @@
   "dialog.mkdirBody": "In %1",
   "dialog.renameTitle": "Rename",
   "dialog.deleteTitle": "Delete %1?",
-  "dialog.deleteLocalBody": "It goes to the Trash when possible.",
+  "dialog.deleteLocalBody": "It goes to the Trash. If that fails, nothing is deleted.",
   "dialog.deleteRemoteBody": "This permanently deletes it from %1. There is no Trash on the other machine.",
   "dialog.userTitle": "User name for %1",
   "dialog.userBody": "The account to sign in as on that machine. Leave empty to use %1.",

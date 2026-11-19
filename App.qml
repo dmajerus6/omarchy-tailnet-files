@@ -332,7 +332,12 @@ Item {
       for (var i = 0; i < ctx.items.length; i++) paths.push(ctx.items[i].path)
       setStatus(strings.t("status.deleting"), false)
       backend.run(["delete", dp.target].concat(paths), function(res) {
-        if (!res.ok) { root.setStatus(String(res.error), true); return }
+        if (!res.ok) {
+          root.setStatus(String(res.error), true)
+          // Some items may already be gone (trashed before a failure).
+          if (res.trashed) { dp.clearMarks(); dp.refresh() }
+          return
+        }
         root.setStatus(res.trashed ? strings.t("status.trashed") : strings.t("status.deleted"), false)
         dp.clearMarks()
         dp.refresh()

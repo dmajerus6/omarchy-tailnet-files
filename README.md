@@ -24,8 +24,9 @@ Then click the folder icon in the bar.
 - OpenSSH client: `ssh`, `sftp`, `scp`, `ssh-keygen`, `ssh-copy-id` (Omarchy ships these)
 - Python 3, standard library only
 - `xdg-open` (xdg-utils) to open files in their default app
-- Optional: `rsync` on both ends for resumable copies, `gio` (glib2) to move local
-  deletes to the Trash, `notify-send` for "transfer finished" notifications
+- `gio` (glib2) to move local deletes to the Trash
+- Optional: `rsync` on both ends for resumable copies, `notify-send` for
+  "transfer finished" notifications
 
 The plugin runs as your user, needs no root access, and does not edit your
 Hyprland config, keybindings or `~/.ssh/config`. It writes only:
@@ -142,9 +143,12 @@ setting is saved in `~/.config/tailfiles/hosts.json`. Settings in
   leaves wildcards for the far end to expand, so a copy that involves such a
   remote name goes through scp instead. Names containing control characters
   are refused.
-- Deleting on this computer moves things to the Trash (`gio trash`). Deleting
-  on another machine is permanent. The helper refuses to delete `/`, a drive
-  root, either machine's home folder, or any path with `.` or `..` in it. On
+- Deleting on this computer only ever moves things to the Trash (`gio trash`).
+  If that fails, the item stays where it is; there is no permanent fallback.
+  Deleting on another machine is permanent. The helper refuses to delete `/`,
+  a drive root, that machine's home folder or anything containing it, or any
+  path with `.` or `..` in it. It looks up the home folder fresh before each
+  delete (on Windows, from where SFTP starts) and deletes nothing if it can't. On
   Linux and macOS the paths go to `xargs -0 rm -rf --` on standard input, so
   no remote shell parses them. On Windows it walks the folder over SFTP,
   removes a selected symlink without following it, and builds every command

@@ -213,6 +213,17 @@ def run_ssh(host, remote_cmd, timeout=30, input_data=None):
     return proc.returncode, proc.stdout, clean_stderr(proc.stderr)
 
 
+def sftp_home(host):
+    """The folder an sftp session starts in (the account's home), or ""."""
+    rc, stdout, _ = run_sftp(host, ["pwd"])
+    if rc != 0:
+        return ""
+    for line in stdout.splitlines():
+        if line.startswith("Remote working directory: "):
+            return line[len("Remote working directory: "):].strip()
+    return ""
+
+
 def probe(host, use_cache=True):
     path = os.path.join(RUNTIME, "probe-" + host + ".json")
     if use_cache:
@@ -231,7 +242,10 @@ def probe(host, use_cache=True):
     if len(lines) >= 4 and lines[0] == "__TF__" and lines[1] in POSIX_SYSTEMS:
         info.update(posix=True, system=lines[1], rsync=lines[2] == "rsync=yes", home=lines[3])
     else:
+        # Windows OpenSSH: no POSIX shell, but sftp starts in the profile
+        # folder, e.g. /C:/Users/name.
         info["system"] = "Windows"
+        info["home"] = sftp_home(host)
     try:
         os.makedirs(RUNTIME, mode=0o700, exist_ok=True)
         with open(path, "w") as fh:
@@ -512,17 +526,33 @@ def cmd_copy(args):
 
 # ---------------------------------------------------------------- file ops
 
-def guard_delete(path, home=None):
-    """Refuse anything that isn't a plain absolute path strictly below a
-    root, a drive or the home folder of the machine it is on."""
+def guard_key(path, windows):
+    """Comparable form of a path: Windows paths are case-insensitive, accept
+    either slash and may be written /C:/x or C:/x."""
+    p = path
+    if windows:
+        p = p.replace("\\", "/")
+        if re.match(r"^[A-Za-z]:(/|$)", p):
+            p = "/" + p
+        p = p.lower()
+    return p.rstrip("/") or "/"
+
+
+def guard_delete(path, home, windows=False):
+    """Refuse anything but a plain absolute path that is not a root, a
+    drive, the home folder of the machine it is on, or an ancestor of that
+    home. Without a known home nothing is deleted."""
     check_path(path)
-    norm = path.rstrip("/") or "/"
-    parts = norm.split("/")
-    homes = {h.rstrip("/") for h in (HOME, home) if h}
-    if (not norm.startswith("/") and not re.match(r"^[A-Za-z]:/", norm)) \
-            or any(p in (".", "..") for p in parts) \
-            or norm in ("/", "~") or norm in homes \
-            or re.match(r"^/?[A-Za-z]:/?$", norm):
+    if not home:
+        fail("Refusing to delete: couldn't determine the home folder on that machine")
+    norm = guard_key(path, windows)
+    homes = {guard_key(home, windows)}
+    if not windows:
+        homes.add(guard_key(HOME, False))
+    if not norm.startswith("/") \
+            or any(p in (".", "..") for p in norm.split("/")) \
+            or norm == "/" or re.match(r"^/[a-z]:$", norm, re.I) \
+            or any(norm == h or h.startswith(norm + "/") for h in homes):
         fail("Refusing to delete " + path)
 
 
@@ -591,27 +621,29 @@ def cmd_delete(target, paths):
     # No trailing slash: `rm -rf link/` would act on the link's target.
     paths = [p.rstrip("/") or "/" for p in paths]
     if target == "local":
+        # This computer only ever uses the Trash. If moving something there
+        # fails, stop: never fall back to deleting it permanently.
         for p in paths:
-            guard_delete(p)
+            guard_delete(p, HOME)
         trash = shutil.which("gio")
-        for p in paths:
-            if trash and subprocess.run([trash, "trash", "--", p], capture_output=True).returncode == 0:
-                continue
-            try:
-                if os.path.isdir(p) and not os.path.islink(p):
-                    shutil.rmtree(p)
-                else:
-                    os.remove(p)
-            except OSError as e:
-                fail(str(e))
-        out({"ok": True, "trashed": bool(trash)})
+        if not trash:
+            fail("Can't move to the Trash: gio (glib2) is not installed. Nothing was deleted.")
+        for i, p in enumerate(paths):
+            proc = subprocess.run([trash, "trash", "--", p], capture_output=True, text=True,
+                                  stdin=subprocess.DEVNULL)
+            if proc.returncode != 0:
+                why = (proc.stderr.strip().splitlines() or ["gio trash failed"])[-1]
+                done = "" if i == 0 else " The %d before it went to the Trash." % i
+                fail("Couldn't move %s to the Trash (%s). It was not deleted.%s"
+                     % (os.path.basename(p) or p, why, done), trashed=i)
+        out({"ok": True, "trashed": True})
         return
     host = check_host(target)
-    info = probe(host)
+    info = probe(host, use_cache=False)  # fresh: the guard needs this machine's home
     if not info.get("ok"):
         fail(info.get("error", "Could not connect"), info.get("kind", "other"))
     for p in paths:
-        guard_delete(p, info.get("home"))
+        guard_delete(p, info.get("home"), windows=not info.get("posix"))
     if info.get("posix"):
         # The command is fixed; the paths travel NUL-separated on stdin, so
         # no shell (whatever the login shell is) ever parses or globs them.
