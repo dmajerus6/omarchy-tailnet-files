@@ -157,15 +157,30 @@ setting is saved in `~/.config/tailfiles/hosts.json`. Settings in
   path with `.` or `..` in it. It looks up the home folder fresh before each
   delete (on Windows, from where SFTP starts) and deletes nothing if it can't.
   It checks each path both as written and with its parent folders' symlinks
-  resolved by the machine that holds it, then deletes the resolved path. A
-  selected symlink is removed itself, never its target.
-- A New folder, Rename or Delete dialog acts only on the machine and folder
-  it was opened for. If that side changes before you confirm, nothing
-  happens. On
-  Linux and macOS the paths go to `xargs -0 rm -rf --` on standard input, so
-  no remote shell parses them. On Windows it walks the folder over SFTP,
-  removes a selected symlink without following it, and builds every command
-  before running any of them.
+  resolved by the machine that holds it. On Linux and macOS the paths then go
+  NUL-separated over stdin to one fixed remote script, which enters each
+  parent folder physically, checks the real location against the account's
+  home again, and removes the item relative to that folder, so nothing can
+  redirect it between the check and the delete. On Windows it walks the
+  folder over SFTP and builds every command before running any. A selected
+  symlink is removed itself, never its target.
+- Every reply from `sftp` must have the exact shape of the commands sent
+  (each command echoed, `cd` silent, `pwd` one line). A folder or file name
+  containing a line break breaks that shape, so the action stops instead of
+  reading a shorter path.
+- Each run of the helper fixes the SSH account once and passes it to every
+  `ssh`/`sftp`/`scp`/`rsync` it starts. The window sends the account each
+  listing was made under, so a dialog or copy acts as that account even if
+  *Change user* saves another one meanwhile.
+- Nothing is overwritten without asking. Copying onto a name that already
+  exists asks to replace it first (files are replaced, folders merged), and
+  the helper refuses if it finds a clash the listing didn't show. Rename never
+  replaces an existing item (`renameat2(RENAME_NOREPLACE)` here, the plain
+  SFTP rename remotely).
+- Files downloaded to open them lose their execute bits.
+- A New folder, Rename, Delete or Replace dialog acts only on the machine,
+  account and folder it was opened for. If that side changes before you
+  confirm, nothing happens.
 
 ## Files
 

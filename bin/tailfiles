@@ -23,6 +23,9 @@ TARGET is "local" for this computer or an SSH host name from `peers`.
 """
 
 import base64
+import errno
+import glob
+import hashlib
 import fcntl
 import json
 import os
@@ -94,6 +97,50 @@ def host_user(host):
     return user if isinstance(user, str) and USER_RE.match(user) else None
 
 
+PINNED_USERS = {}  # host -> account given with --as for this run
+_ACCOUNTS = {}      # host -> account resolved once for this run
+
+
+def ssh_config_user(host):
+    """The account plain `ssh HOST` would use (~/.ssh/config, else local)."""
+    try:
+        proc = subprocess.run(["ssh", "-G", host], capture_output=True, timeout=10, env=ENV,
+                              stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    for line in decode_raw(proc.stdout).split("\n"):
+        if line.startswith("user "):
+            return line[5:]
+    return ""
+
+
+def account(host):
+    """The SSH account for `host`, resolved once and then fixed for the whole
+    run: from --as (what the window showed and the user confirmed), else the
+    saved setting, else ssh's own config. Every ssh/sftp/scp/rsync child gets
+    it explicitly, so changing the saved account mid-run can't switch
+    accounts between a check and the action it guards."""
+    if host not in _ACCOUNTS:
+        user = PINNED_USERS.get(host) or host_user(host) or ssh_config_user(host)
+        if not user or not USER_RE.match(user):
+            fail("Can't tell which account to use on " + host)
+        _ACCOUNTS[host] = user
+    return _ACCOUNTS[host]
+
+
+def probe_cache_path(host):
+    tag = hashlib.sha256(account(host).encode("utf-8", "surrogateescape")).hexdigest()[:16]
+    return os.path.join(RUNTIME, "probe-%s-%s.json" % (host, tag))
+
+
+def forget_probe(host):
+    for f in glob.glob(os.path.join(glob.escape(RUNTIME), "probe-%s*.json" % glob.escape(host))):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+
+
 def check_host(host):
     if not host or not HOST_RE.match(host) or host.startswith("-"):
         fail("Invalid host name: %r" % host)
@@ -115,9 +162,7 @@ def ssh_opts(host, batch=True):
     ]
     if batch:
         opts += ["-o", "BatchMode=yes"]
-    user = host_user(host)
-    if user:
-        opts += ["-o", "User=" + user]
+    opts += ["-o", "User=" + account(host)]
     return opts
 
 
@@ -213,16 +258,68 @@ def lines_of(text):
 PWD_PREFIX = "Remote working directory: "
 
 
-def first_pwd(text):
-    """The folder printed by the first sftp `pwd`, exactly as printed."""
-    for line in lines_of(text):
-        if line.startswith(PWD_PREFIX):
-            return line[len(PWD_PREFIX):]
-    return ""
+ECHO = "sftp> "
 
 
-def all_pwds(text):
-    return [l[len(PWD_PREFIX):] for l in lines_of(text) if l.startswith(PWD_PREFIX)]
+def segment_ok(command, seg):
+    """Does one command's output have exactly the shape that command produces?"""
+    verb = command.lstrip("-").split(" ", 1)[0]
+    if any(line.startswith(ECHO) for line in seg):
+        return False  # a forged echo: some name or folder contains a line break
+    if verb in ("cd", "mkdir", "rmdir", "rename"):
+        return seg == []
+    if verb == "pwd":
+        return len(seg) == 1 and seg[0].startswith(PWD_PREFIX) and not CONTROL_RE.search(seg[0])
+    return True
+
+
+def sftp_segments(stdout, commands):
+    """Split one batch's stdout into each command's output, or None.
+
+    sftp echoes every command as "sftp> COMMAND" and prints `pwd` as one
+    line. A folder or file name containing a line break makes extra lines,
+    which can't fit this exact shape: cd prints nothing, pwd exactly one
+    line, and no output line may look like an echo. So any such output is
+    rejected instead of being read as a shorter path or a different name.
+    If the batch stopped at a failing command, the segments end there."""
+    lines = lines_of(stdout)
+    if lines and lines[-1] == "":
+        lines.pop()
+    segs, i = [], 0
+    for n, command in enumerate(commands):
+        if i >= len(lines):
+            break
+        if lines[i] != ECHO + command:
+            return None
+        i += 1
+        nxt = ECHO + commands[n + 1] if n + 1 < len(commands) else None
+        start = i
+        while i < len(lines) and lines[i] != nxt:
+            i += 1
+        seg = lines[start:i]
+        if not segment_ok(command, seg):
+            return None
+        segs.append(seg)
+    if i != len(lines):
+        return None
+    return segs
+
+
+def pwd_value(seg):
+    return seg[0][len(PWD_PREFIX):]
+
+
+def sftp_batch(host, commands, timeout=60, what="that folder"):
+    """Run a batch whose every command must succeed and whose output must have
+    the exact expected shape; return the per-command outputs."""
+    rc, stdout, err = run_sftp(host, commands, timeout)
+    if rc != 0:
+        fail(error_text(err, "Could not read " + what + " on " + host), classify(err))
+    segs = sftp_segments(stdout, commands)
+    if segs is None or len(segs) != len(commands):
+        fail("The reply about %s on %s didn't have the expected shape (a name in it may contain "
+             "a line break), so nothing was done" % (what, host))
+    return segs
 
 
 def run_sftp(host, commands, timeout=60):
@@ -252,13 +349,12 @@ def run_ssh(host, remote_cmd, timeout=30, input_data=None):
 def sftp_home(host):
     """The folder an sftp session starts in (the account's home), or ""."""
     rc, stdout, _ = run_sftp(host, ["pwd"])
-    if rc != 0:
-        return ""
-    return first_pwd(stdout)
+    segs = sftp_segments(stdout, ["pwd"]) if rc == 0 else None
+    return pwd_value(segs[0]) if segs and len(segs) == 1 else ""
 
 
 def probe(host, use_cache=True):
-    path = os.path.join(RUNTIME, "probe-" + host + ".json")
+    path = probe_cache_path(host)
     if use_cache:
         try:
             if time.time() - os.path.getmtime(path) < 600:
@@ -266,15 +362,19 @@ def probe(host, use_cache=True):
                     return json.load(fh)
         except (OSError, ValueError):
             pass
-    rc, stdout, err = run_ssh(host, 'echo __TF__; uname -s; command -v rsync >/dev/null 2>&1 && echo rsync=yes || echo rsync=no; printf "%s\\n" "$HOME"')
+    rc, stdout, err = run_ssh(host, 'echo __TF__; uname -s; command -v rsync >/dev/null 2>&1 && echo rsync=yes || echo rsync=no; printf "%s\\0" "$HOME"')
     if rc == 255:
         kind = classify(err)
         return {"ok": False, "kind": kind, "error": error_text(err, "Could not connect to " + host)}
-    lines = lines_of(stdout)
+    lines = stdout.split("\n", 3)
     info = {"ok": True, "posix": False, "rsync": False, "system": "", "home": ""}
-    if len(lines) >= 4 and lines[0].strip() == "__TF__" and lines[1].strip() in POSIX_SYSTEMS:
-        # $HOME is printed with printf "%s\n": take it exactly, untrimmed.
-        info.update(posix=True, system=lines[1].strip(), rsync=lines[2].strip() == "rsync=yes", home=lines[3])
+    if len(lines) == 4 and lines[0].strip() == "__TF__" and lines[1].strip() in POSIX_SYSTEMS:
+        # $HOME is printed NUL-terminated, so it is taken exactly; one with a
+        # control character is unusable and left empty (deletes then refuse).
+        home, nul, _ = lines[3].partition("\0")
+        if not nul or CONTROL_RE.search(home):
+            home = ""
+        info.update(posix=True, system=lines[1].strip(), rsync=lines[2].strip() == "rsync=yes", home=home)
     else:
         # Windows OpenSSH: no POSIX shell, but sftp starts in the profile
         # folder, e.g. /C:/Users/name.
@@ -343,35 +443,29 @@ def list_local(path):
     return {"ok": True, "path": path, "entries": entries, "home": HOME}
 
 
-def sftp_entries(stdout, names=None):
-    """Parse `pwd` + `ls -lan` output from one sftp batch.
+def sftp_entries(ls_lines, names=None):
+    """Parse the output lines of one sftp `ls -lan`.
 
-    The folder is the first `pwd` line, which comes before the listing, so a
-    file name can't forge it. Entries are read only after the `ls` echo.
-    Nothing is trimmed. With `names` (the folder's exact names from another
-    source) an entry is kept only if its name is one of them. A name that
-    appears twice is always left out. Returns (pwd, entries, skipped)."""
-    lines = lines_of(stdout)
-    pwd = first_pwd(stdout)
-    start = next((i for i, l in enumerate(lines) if l.startswith("sftp> ls")), -1)
+    Nothing is trimmed. `ls -lan` is formatted by the sftp client, which never
+    appends a link's target, so the text after the date is the whole name,
+    even for a link literally called "a -> b". With `names` (the folder's
+    exact names from another source) an entry is kept only if its name is
+    one of them. A name that appears twice is always left out. Returns
+    (entries, skipped)."""
     parsed = []
     skipped = 0
-    for line in lines[start + 1:] if start >= 0 else []:
+    for line in ls_lines:
         m = LONG_RE.match(line)
         if not m:
             continue
-        perm, size, mon, day, rest, text = m.group(1), int(m.group(5)), m.group(6), m.group(7), m.group(8), m.group(9)
-        kind = {"d": "dir", "l": "link"}.get(perm[0], "file")
-        name, target = text, ""
-        if text in (".", ".."):
+        perm, size, mon, day, rest, name = m.group(1), int(m.group(5)), m.group(6), m.group(7), m.group(8), m.group(9)
+        if name in (".", ".."):
             continue
-        # `ls -lan` is formatted by the sftp client, which never appends a
-        # link's target, so the text after the date is the whole name, even
-        # for a link literally called "a -> b".
         if names is not None and name not in names:
             skipped += 1
             continue
-        parsed.append({"name": name, "type": kind, "link": kind == "link", "target": target,
+        kind = {"d": "dir", "l": "link"}.get(perm[0], "file")
+        parsed.append({"name": name, "type": kind, "link": kind == "link", "target": "",
                        "size": size if kind == "file" else 0,
                        "mtime": parse_mtime(mon, day, rest), "perm": perm})
     counts = {}
@@ -379,7 +473,7 @@ def sftp_entries(stdout, names=None):
         counts[e["name"]] = counts.get(e["name"], 0) + 1
     entries = [e for e in parsed if counts[e["name"]] == 1]
     skipped += len(parsed) - len(entries)
-    return pwd, entries, skipped
+    return entries, skipped
 
 
 # Exact names in a folder on a POSIX machine, NUL-separated. The command is
@@ -395,40 +489,57 @@ def exact_names(host, folder):
     return {n[2:] if n.startswith("./") else n for n in stdout.split("\0") if n}
 
 
-def list_remote(host, path):
-    cmds = []
-    if path:
-        cmds.append("cd " + sftp_quote(path))
-    cmds += ["pwd", "ls -lan"]
+def basename_of(path):
+    return path.rstrip("/").rpartition("/")[2]
+
+
+def existing_names(target, folder, wanted):
+    """Which of `wanted` (plain names) already exist in `folder`."""
+    if target == "local":
+        return [n for n in wanted if os.path.lexists(os.path.join(folder, n))]
+    host = check_host(target)
+    if probe(host).get("posix"):
+        have = exact_names(host, folder)
+        return [n for n in wanted if n in have]
+    # No shell: ask sftp about each exact path. `ls` of something that exists
+    # prints at least one line (a folder lists . and ..); of nothing, none.
+    cmds = ["-ls -lan " + sftp_quote(join_remote(folder, n)) for n in wanted]
     rc, stdout, err = run_sftp(host, cmds)
-    if rc != 0:
-        fail(error_text(err, "Could not list " + (path or "home") + " on " + host), classify(err))
-    pwd = first_pwd(stdout)
-    if not pwd:
-        fail("Could not tell which folder " + host + " listed")
+    segs = sftp_segments(stdout, cmds) if rc == 0 else None
+    if segs is None or len(segs) != len(cmds):
+        fail(error_text(err, "Couldn't check what already exists in " + folder), classify(err))
+    return [n for n, seg in zip(wanted, segs) if seg]
+
+
+def list_remote(host, path):
+    cmds = (["cd " + sftp_quote(path)] if path else []) + ["pwd", "ls -lan"]
+    segs = sftp_batch(host, cmds, what=path or "the home folder")
+    pwd, ls_lines = pwd_value(segs[-2]), segs[-1]
     # sftp's listing is text, so a name with a line break in it could read
     # as a different name. On POSIX machines, check every name against the
     # folder's exact names; Windows names can't contain line breaks.
     names = exact_names(host, pwd) if probe(host).get("posix") else None
-    pwd, entries, skipped = sftp_entries(stdout, names)
+    entries, skipped = sftp_entries(ls_lines, names)
     # Links whose target is a folder should open like folders. Ask the server
-    # in one round trip which of them `cd` into.
-    # Each check prints one working directory: unchanged means the cd failed.
+    # in one round trip which of them `cd` into: each check prints one
+    # working directory, unchanged when the cd failed.
     links = [e for e in entries if e["type"] == "link"][:200]
     if links:
         checks = ["cd " + sftp_quote(pwd)]
         for e in links:
             checks += ["-cd " + sftp_quote(join_remote(pwd, e["name"])), "pwd", "cd " + sftp_quote(pwd)]
-        _, so2, _ = run_sftp(host, checks)
-        seen = all_pwds(so2)
-        if len(seen) != len(links):
+        rc, so2, _ = run_sftp(host, checks)
+        segs2 = sftp_segments(so2, checks) if rc == 0 else None
+        if segs2 is not None and len(segs2) == len(checks):
+            seen = [pwd_value(segs2[2 + 3 * k]) for k in range(len(links))]
+        else:
             seen = [pwd] * len(links)  # can't tell reliably: show them as files
-        for i, e in enumerate(links):
-            e["type"] = "dir" if seen[i] != pwd else "file"
+        for k, e in enumerate(links):
+            e["type"] = "dir" if seen[k] != pwd else "file"
     for e in entries:
         if e["type"] == "link":
             e["type"] = "file"
-    return {"ok": True, "path": pwd, "entries": entries, "skipped": skipped}
+    return {"ok": True, "path": pwd, "entries": entries, "skipped": skipped, "user": account(host)}
 
 
 def join_remote(base, name):
@@ -546,8 +657,11 @@ def parse_scp(line):
 
 
 def cmd_copy(args):
+    replace = bool(args) and args[0] == "--replace"
+    if replace:
+        args = args[1:]
     if len(args) < 4:
-        fail("usage: copy SRC_TARGET DST_TARGET DST_DIR PATH...")
+        fail("usage: copy [--replace] SRC_TARGET DST_TARGET DST_DIR PATH...")
     src, dst, dst_dir, paths = args[0], args[1], args[2], args[3:]
     for t in (src, dst):
         if t != "local":
@@ -578,10 +692,22 @@ def cmd_copy(args):
                  "error": "%r contains a control character, so it can't be copied safely" % p})
             return 1
 
+    # Never overwrite without the user's say-so: unless --replace, refuse when
+    # any item already exists at the destination (the window then asks).
+    if not replace:
+        clash = existing_names(dst, dst_dir, [basename_of(p) for p in paths])
+        if clash:
+            out({"event": "done", "ok": False, "kind": "exists", "names": clash,
+                 "error": "%s already exist%s in %s" % (", ".join(clash[:3]) + ("…" if len(clash) > 3 else ""),
+                                                         "s" if len(clash) == 1 else "", dst_dir)})
+            return 1
+
     out({"event": "start", "engine": "rsync" if use_rsync else "scp", "count": len(paths)})
     if use_rsync:
         host = remote[0] if remote else None
         cmd = ["rsync", "--no-old-args", "-a", "-h", "--partial", "--info=progress2", "--no-inc-recursive", "--outbuf=L"]
+        if not replace:
+            cmd.append("--ignore-existing")  # in case something appeared since the check
         if host:
             cmd += ["-e", "ssh " + " ".join(shlex.quote(o) for o in ssh_opts(host))]
         cmd += ["--"] + [remote_spec(src, p.rstrip("/") or "/") for p in paths]
@@ -593,8 +719,7 @@ def cmd_copy(args):
         if len(remote) == 2:
             # Each end may need its own user; scp takes those inline.
             def spec(t, p):
-                u = host_user(t)
-                return (u + "@" if u else "") + t + ":" + p
+                return account(t) + "@" + t + ":" + p
         else:
             spec = remote_spec
         # Sources are globbed by scp's SFTP mode; the destination is not.
@@ -653,16 +778,45 @@ def cmd_mkdir(target, path):
     out({"ok": True})
 
 
+def rename_noreplace(old, new):
+    """Rename that fails instead of replacing an existing `new`."""
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = libc.renameat2
+        renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    except (OSError, AttributeError):
+        renameat2 = None
+    if renameat2 is not None:
+        AT_FDCWD, RENAME_NOREPLACE = -100, 1
+        if renameat2(AT_FDCWD, os.fsencode(old), AT_FDCWD, os.fsencode(new), RENAME_NOREPLACE) == 0:
+            return
+        err = ctypes.get_errno()
+        if err not in (errno.ENOSYS, errno.EINVAL):  # EINVAL: filesystem lacks the flag
+            raise OSError(err, os.strerror(err), new)
+    if os.path.lexists(new):
+        raise FileExistsError(errno.EEXIST, "File exists", new)
+    os.rename(old, new)
+
+
 def cmd_rename(target, old, new):
+    check_path(old)
+    check_path(new)
     if target == "local":
-        if os.path.exists(new):
-            fail("Something named that already exists")
         try:
-            os.rename(old, new)
+            rename_noreplace(old, new)
+        except FileExistsError:
+            fail("Something named that already exists")
         except OSError as e:
             fail(str(e))
     else:
-        rc, _, err = run_sftp(check_host(target), ["rename " + sftp_quote(old) + " " + sftp_quote(new)])
+        host = check_host(target)
+        parent = new.rstrip("/").rpartition("/")[0] or "/"
+        if existing_names(target, parent, [basename_of(new)]):
+            fail("Something named that already exists")
+        # -l: the plain SFTP rename, which fails if the new name exists. The
+        # default posix-rename extension would silently replace it.
+        rc, _, err = run_sftp(host, ["rename -l " + sftp_quote(old) + " " + sftp_quote(new)])
         if rc != 0:
             fail(error_text(err, "Could not rename"), classify(err))
     out({"ok": True})
@@ -672,10 +826,8 @@ def remote_is_link(host, path):
     """True when `path` itself is a symlink (judged from its parent's listing,
     since `cd` would follow it)."""
     parent, _, name = path.rstrip("/").rpartition("/")
-    rc, stdout, err = run_sftp(host, ["cd " + sftp_quote(parent or "/"), "ls -lan"])
-    if rc != 0:
-        fail(error_text(err, "Could not inspect " + path), classify(err))
-    for e in sftp_entries(stdout)[1]:
+    segs = sftp_batch(host, ["cd " + sftp_quote(parent or "/"), "ls -lan"], what=parent or "/")
+    for e in sftp_entries(segs[1])[0]:
         if e["name"] == name:
             return e["type"] == "link"
     fail("%s no longer exists" % path, "notfound")
@@ -687,11 +839,15 @@ def sftp_walk_delete(host, path, cmds, top=True):
     if top and remote_is_link(host, path):
         cmds.append("rm " + sftp_quote(path))  # the link only, never its target
         return
-    rc, stdout, err = run_sftp(host, ["cd " + sftp_quote(path), "pwd", "ls -lan"])
+    batch = ["cd " + sftp_quote(path), "pwd", "ls -lan"]
+    rc, stdout, err = run_sftp(host, batch)
     if rc != 0:
-        cmds.append("rm " + sftp_quote(path))
+        cmds.append("rm " + sftp_quote(path))  # not a folder
         return
-    _, entries, _ = sftp_entries(stdout)
+    segs = sftp_segments(stdout, batch)
+    if segs is None or len(segs) != len(batch):
+        fail("The listing of %s didn't have the expected shape, so nothing was deleted" % path)
+    entries, _ = sftp_entries(segs[2])
     for e in entries:
         child_path = join_remote(path, e["name"])
         if e["type"] == "dir":
@@ -701,21 +857,46 @@ def sftp_walk_delete(host, path, cmds, top=True):
     cmds.append("rmdir " + sftp_quote(path))
 
 
+# Deletes on POSIX machines run this fixed script; the paths arrive
+# NUL-separated on stdin (xargs -0), so no shell ever parses them. For each
+# path it enters the parent folder physically (cd -P), re-checks the real
+# location against the account's own resolved home and its ancestors, and
+# removes the item relative to the folder it is now in. Nothing can redirect
+# the delete between that check and the rm, and the item's own name is never
+# followed (a symlink is removed itself). `real` keeps names that end in a
+# line break intact, which $(...) alone would trim.
+POSIX_DELETE_SCRIPT = (
+    'nl=$(printf "\\nx"); nl=${nl%x}; '
+    'real() { r=$(pwd -P && echo .) || return 1; r=${r%.}; r=${r%"$nl"}; }; '
+    'cd -P -- "$HOME" && real || { echo "cannot resolve the home folder" >&2; exit 3; }; H=$r; st=0; '
+    'for p do '
+    'case $p in /*) ;; *) echo "not absolute: $p" >&2; st=4; continue;; esac; '
+    'parent=${p%/*}; name=${p##*/}; [ -n "$parent" ] || parent=/; '
+    'case $name in ""|.|..) echo "refusing: $p" >&2; st=4; continue;; esac; '
+    'if cd -P -- "$parent" && real; then '
+    'case $r in /) t=/$name;; *) t=$r/$name;; esac; '
+    'case "$H/" in "$t"/*) echo "Refusing to delete $t" >&2; st=5; continue;; esac; '
+    'rm -rf -- "./$name" || st=1; '
+    'else st=1; fi; '
+    'done; exit $st'
+)
+POSIX_DELETE_CMD = "xargs -0 sh -c '%s' sh" % POSIX_DELETE_SCRIPT
+
+
 def resolve_remote_parents(host, paths):
     """Each path with its parent folder resolved by the server (sftp `cd`
     uses the server's realpath, following every symlink) and its own name
-    kept: rm and the SFTP walk remove a link itself, never its target."""
+    kept: rm and the SFTP walk remove a link itself, never its target. The
+    reply must have the exact expected shape, so a resolved folder whose
+    name contains a line break fails the delete instead of being cut short."""
     cmds = []
     names = []
     for p in paths:
         parent, _, name = p.rstrip("/").rpartition("/")
         cmds += ["cd " + sftp_quote(parent or "/"), "pwd"]
         names.append(name)
-    rc, stdout, err = run_sftp(host, cmds)
-    seen = all_pwds(stdout)
-    if rc != 0 or len(seen) != len(paths):
-        fail(error_text(err, "Couldn't resolve the folders to delete from; nothing was deleted"), classify(err))
-    return [join_remote(seen[i], names[i]) for i in range(len(paths))]
+    segs = sftp_batch(host, cmds, what="the folders to delete from")
+    return [join_remote(pwd_value(segs[2 * k + 1]), names[k]) for k in range(len(paths))]
 
 
 def cmd_delete(target, paths):
@@ -767,7 +948,7 @@ def cmd_delete(target, paths):
     if info.get("posix"):
         # The command is fixed; the paths travel NUL-separated on stdin, so
         # no shell (whatever the login shell is) ever parses or globs them.
-        rc, _, err = run_ssh(host, "xargs -0 rm -rf --", timeout=300,
+        rc, _, err = run_ssh(host, POSIX_DELETE_CMD, timeout=300,
                              input_data="".join(p + "\0" for p in paths))
         if rc != 0:
             fail(error_text(err, "Delete failed"), classify(err))
@@ -786,12 +967,26 @@ def cmd_open(target, path):
         host = check_host(target)
         dest_dir = os.path.join(CACHE_DIR, "open", host)
         os.makedirs(dest_dir, exist_ok=True)
-        dest = os.path.join(dest_dir, os.path.basename(path.rstrip("/")) or "file")
+        name = basename_of(path) or "file"
+        if name in (".", ".."):
+            fail("Can't open " + path)
+        dest = os.path.join(dest_dir, name)
+        # A fresh copy each time (never into a stale folder of the same name).
+        if os.path.isdir(dest) and not os.path.islink(dest):
+            shutil.rmtree(dest)
+        elif os.path.lexists(dest):
+            os.remove(dest)
         cmd = ["scp", "-p", "-r"] + ssh_opts(host) + ["--", host + ":" + glob_escape(path), dest]
         proc = subprocess.run(cmd, capture_output=True, text=True, env=ENV, stdin=subprocess.DEVNULL, timeout=600)
         if proc.returncode != 0:
             err = clean_stderr(proc.stderr)
             fail(error_text(err, "Could not fetch file"), classify(err))
+        # Downloaded files are opened by their default app, never run.
+        for root_dir, _, files in (os.walk(dest) if os.path.isdir(dest) else [("", [], [dest])]):
+            for f in files:
+                fp = os.path.join(root_dir, f) if root_dir else f
+                if not os.path.islink(fp):
+                    os.chmod(fp, os.lstat(fp).st_mode & 0o666)
         path = dest
     subprocess.Popen(["xdg-open", path], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, start_new_session=True)
@@ -877,7 +1072,7 @@ if ($admin) {
 
 def cmd_setup_key(host):
     host = check_host(host)
-    user = host_user(host) or os.environ.get("USER", "")
+    user = account(host)
     ssh_dir = os.path.join(HOME, ".ssh")
     pub = next((os.path.join(ssh_dir, k) for k in ("id_ed25519.pub", "id_ecdsa.pub", "id_rsa.pub")
                 if os.path.exists(os.path.join(ssh_dir, k))), None)
@@ -922,7 +1117,7 @@ def cmd_setup_key(host):
                      start_new_session=True)
     # The next probe must see the new key rather than a cached failure.
     try:
-        os.remove(os.path.join(RUNTIME, "probe-" + host + ".json"))
+        forget_probe(host)
     except OSError:
         pass
     out({"ok": True})
@@ -934,6 +1129,15 @@ def main(argv):
     if not argv or argv[0] in ("-h", "--help"):
         print(__doc__)
         return 0
+    while len(argv) >= 2 and argv[0] == "--as":
+        host, _, user = argv[1].partition("=")
+        check_host(host)
+        if not user or not USER_RE.match(user):
+            fail("Invalid account for %s" % host)
+        PINNED_USERS[host] = user
+        argv = argv[2:]
+    if not argv:
+        fail("No command")
     cmd, args = argv[0], argv[1:]
     if cmd == "peers":
         cmd_peers()
@@ -968,7 +1172,7 @@ def main(argv):
             data["hosts"].pop(host, None)
         save_config(data)
         try:
-            os.remove(os.path.join(RUNTIME, "probe-" + host + ".json"))
+            forget_probe(host)
         except OSError:
             pass
         out({"ok": True})

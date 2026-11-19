@@ -18,6 +18,7 @@
   "footer.marked": { "one": "%1 selected (%2)", "other": "%1 selected (%2)" },
   "footer.filtered": "filter: %1",
   "footer.hidden": "showing hidden",
+  "footer.skipped": { "one": "%1 name not shown (it can't be read safely)", "other": "%1 names not shown (they can't be read safely)" },
 
   "menu.title": "Choose a machine",
   "menu.offline": "offline",
@@ -50,6 +51,7 @@
   "transfer.cancelled": "Cancelled",
   "transfer.cancel": "Cancel",
   "transfer.dismiss": "Dismiss",
+  "transfer.exists": "%1. Copy again to choose whether to replace it.",
 
   "notify.done": "Transfer finished",
   "notify.failed": "Transfer failed",
@@ -61,7 +63,7 @@
   "status.badName": "That name can't be used",
   "status.setupKey": "Finish setting up the key for %1 in the terminal, then press Retry",
   "status.deleting": "Deleting…",
-  "status.dialogStale": "That side switched to another machine or folder, so nothing was changed",
+  "status.dialogStale": "That side switched to another machine, account or folder, so nothing was changed",
   "status.deleted": "Deleted",
   "status.trashed": "Moved to Trash",
   "notice.fetching": "Downloading %1 to open it…",
@@ -77,6 +79,9 @@
   "dialog.cancel": "Cancel",
   "dialog.ok": "OK",
   "dialog.delete": "Delete",
+  "dialog.replace": "Replace",
+  "dialog.replaceTitle": "Replace %1?",
+  "dialog.replaceBody": "Something with the same name is already in %1 on %2. Files with the same name are replaced and folders are merged.",
   "dialog.close": "Close",
 
   "help.title": "Keyboard",

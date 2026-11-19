@@ -28,6 +28,10 @@ Rectangle {
   property string path: ""
   property string home: ""
   property string loadedTarget: ""
+  // The SSH account the current listing was made under; actions on it are
+  // pinned to this account (see helperAs()).
+  property string loadedUser: ""
+  property int skippedCount: 0
   property var entries: []
   property var rows: []
   property var marked: ({})
@@ -88,11 +92,18 @@ Rectangle {
     entries = []
     rows = []
     loadedTarget = ""
+    loadedUser = ""
+    skippedCount = 0
     clearMarks()
     filterText = ""
     error = ""
     errorKind = ""
     load("")
+  }
+
+  // Arguments that pin a helper call to the account this listing was made under.
+  function helperAs() {
+    return (target !== "local" && loadedUser !== "") ? ["--as", target + "=" + loadedUser] : []
   }
 
   function load(p) {
@@ -113,12 +124,15 @@ Rectangle {
         }
         pane.error = String(res.error || pane.tr.t("error.generic"))
         pane.errorKind = String(res.kind || "other")
-        if (fatal) pane.loadedTarget = ""
+        if (fatal) { pane.loadedTarget = ""; pane.loadedUser = "" }
         pane.entries = []
         pane.rebuild(true)
         return
       }
-      var moved = res.path !== pane.path || pane.loadedTarget !== forTarget
+      var user = String(res.user || "")
+      var moved = res.path !== pane.path || pane.loadedTarget !== forTarget || user !== pane.loadedUser
+      pane.loadedUser = user
+      pane.skippedCount = Number(res.skipped || 0)
       pane.error = ""
       pane.errorKind = ""
       pane.path = String(res.path || wanted)
@@ -238,7 +252,7 @@ Rectangle {
   function openFile(row) {
     if (!row || row.type === "up") return
     if (!isLocal) notice(tr.t("notice.fetching").arg(row.name), false)
-    backend.run(["open", target, join(path, row.name)], function(res) {
+    backend.run(helperAs().concat(["open", target, join(path, row.name)]), function(res) {
       if (!res.ok) pane.notice(String(res.error || pane.tr.t("error.generic")), true)
     })
   }
@@ -814,6 +828,7 @@ Rectangle {
         if (pane.markedCount > 0) s += "  ·  " + pane.tr.tn("footer.marked", pane.markedCount).arg(Commons.I18n.formatNumber(pane.markedCount)).arg(pane.formatSize(pane.markedBytes))
         if (pane.filterText !== "") s += "  ·  " + pane.tr.t("footer.filtered").arg(pane.filterText)
         if (pane.showHidden) s += "  ·  " + pane.tr.t("footer.hidden")
+        if (pane.skippedCount > 0) s += "  ·  " + pane.tr.tn("footer.skipped", pane.skippedCount).arg(Commons.I18n.formatNumber(pane.skippedCount))
         return s
       }
     }
