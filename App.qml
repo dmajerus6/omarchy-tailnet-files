@@ -140,19 +140,11 @@ Item {
     activePane = activePane === 0 ? 1 : 0
   }
 
-  // SFTP, the only way into Windows, can't hold a folder open or rename
-  // without a chance of replacing something, so copies and renames there
-  // are refused (the helper refuses them too).
-  function isWindows(v) {
-    return v.target !== "local" && /windows/i.test(String(v.machine.os || ""))
-  }
-
   function copySelection() {
     var src = activeView
     var dst = otherView
     var items = src.selection()
     if (items.length === 0) { setStatus(strings.t("status.nothingSelected"), true); return }
-    if (isWindows(src) || isWindows(dst)) { setStatus(strings.t("status.windowsNoCopy"), true); return }
     if (src.blocked || dst.blocked || dst.path === "") { setStatus(strings.t("status.destinationNotReady"), true); return }
     if (src.target === dst.target && src.path === dst.path) { setStatus(strings.t("status.sameFolder"), true); return }
     // Each side's account is pinned for the copy, so both must be known, and
@@ -318,7 +310,6 @@ Item {
     var v = activeView
     var row = v.currentRow()
     if (!row || row.type === "up" || v.blocked) return
-    if (isWindows(v)) { setStatus(strings.t("status.windowsNoCopy"), true); return }
     openDialog("rename", strings.t("dialog.renameTitle"), "", { pane: v, target: v.target, path: v.path, user: v.loadedUser, name: row.name }, row.name)
   }
 

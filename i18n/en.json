@@ -65,7 +65,6 @@
   "status.setupKey": "Finish setting up the key for %1 in the terminal, then press Retry",
   "status.deleting": "Deleting…",
   "status.accountMismatch": "Both sides are on %1 but signed in as %2 and %3. Use the same account on both sides to copy",
-  "status.windowsNoCopy": "Copying and renaming aren't available on Windows machines, because SFTP can't do them without a chance of replacing something. You can still browse, open files, make folders and delete",
   "status.dialogStale": "That side switched to another machine, account or folder, so nothing was changed",
   "status.deleted": "Deleted",
   "status.trashed": "Moved to Trash",

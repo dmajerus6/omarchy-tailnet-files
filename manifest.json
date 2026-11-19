@@ -5,7 +5,7 @@
   "version": "0.1.0",
   "author": "dmaje",
   "license": "MIT",
-  "description": "Two-pane file browser for the machines on your tailnet. Browse any machine over SFTP and copy files or folders between Linux and macOS machines over SSH.",
+  "description": "Two-pane file browser for the machines on your tailnet. Browse any machine over SFTP and copy files or folders between them over SSH.",
   "kinds": [
     "bar-widget",
     "panel"

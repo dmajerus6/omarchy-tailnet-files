@@ -27,6 +27,8 @@ Then click the folder icon in the bar.
 - On Linux and macOS machines you copy to or from, rename on or Replace
   into: `perl` 5.22 or newer (included with macOS, Debian, Ubuntu and
   Raspberry Pi OS)
+- On Windows machines: Windows PowerShell 5.1 and the .NET Framework 4
+  compiler, both part of Windows 10 and 11
 - Optional: `notify-send` for "transfer finished" notifications
 
 The plugin runs as your user, needs no root access, and does not edit your
@@ -35,6 +37,12 @@ Hyprland config, keybindings or `~/.ssh/config`. It writes only:
 - `~/.config/tailfiles/hosts.json`: the user name per machine and the last machine you opened
 - `~/.cache/tailfiles/open/`: remote files downloaded to open them locally
 - `$XDG_RUNTIME_DIR/tailfiles/`: SSH connection sockets and short-lived caches
+
+On a Windows machine it keeps one small helper program,
+`%LOCALAPPDATA%\TailFiles\agent-<version>.exe`, compiled there from the C#
+source in `bin/tailfiles` the first time it's needed (a few seconds) and
+again only when that source changes. Installing a new version removes any
+other version more than a day old. Delete the folder to remove it.
 
 Things it changes only when you ask it to:
 
@@ -99,10 +107,10 @@ Each machine needs an SSH server you can sign in to without a password prompt:
 
 - **Linux / Raspberry Pi:** `sshd` running.
 - **macOS:** System Settings › General › Sharing › Remote Login.
-- **Windows:** the built-in "OpenSSH Server" optional feature. Windows
-  machines are reached over SFTP and can be browsed, opened from, and have
-  folders made and items deleted. Copying to or from them, and renaming on
-  them, isn't available (see below).
+- **Windows:** the built-in "OpenSSH Server" optional feature (with either
+  `cmd`, the default, or PowerShell as its shell). Everything works on
+  Windows machines too: browse, open, copy to and from, rename, new folder
+  and delete.
 
 Then use one of these to sign in:
 
@@ -132,14 +140,18 @@ setting is saved in `~/.config/tailfiles/hosts.json`. Settings in
   out.
 - SSH connections are shared through a ControlMaster socket in
   `$XDG_RUNTIME_DIR/tailfiles/`, so you only wait for the first connection to a
-  machine. Every later listing reuses it.
+  machine. Every later listing reuses it. Windows machines get a separate
+  connection each time, because Windows' sshd sometimes stalls shared
+  sessions that run at the same time.
 - New host keys are accepted the first time (`StrictHostKeyChecking=accept-new`).
   After that, a changed key is refused. Tailscale already confirms which
   machine you're talking to.
 - Copies hold folders open instead of trusting paths. On this computer the
   helper uses directory file descriptors; on Linux and macOS machines it
-  sends a small fixed Perl program over stdin (paths travel as data, never
-  through a shell). Copies between two machines stream from one to the
+  sends a small fixed Perl program over stdin; on Windows machines it runs
+  a small fixed C# program (see above) that works through NT file handles
+  the same way. Either way, paths travel as data over stdin, never through
+  a shell. Copies between two machines stream from one to the
   other through this computer without touching its disk.
 - Reading: each folder is held open while it is read and every file is
   opened with `O_NOFOLLOW` and checked to be the object that was examined
@@ -161,6 +173,15 @@ setting is saved in `~/.config/tailfiles/hosts.json`. Settings in
   is never overwritten. The hidden folder is emptied through the handle and
   removed when the copy ends (including when it fails or is cancelled), and
   its name only while it still is that folder.
+- Cleanup never looks anything up by name. The helper that made the hidden
+  folder (or, on Windows, the temporary items) removes it through its own
+  handles whenever it stops: when it finishes, fails, is cancelled, or its
+  connection ends, even if this computer's side is killed outright. Nothing
+  else ever deletes a `.tailfiles-incoming-…` name, so a folder someone
+  else puts under that name in a shared destination is never touched. Only
+  if the helper process itself is killed on the other machine can an empty
+  or partial hidden folder stay behind; it is then left alone for you to
+  remove.
 - Nothing another machine sends can make the helper use unbounded memory:
   names, link targets and numbers in a copy are capped, folder nesting is
   capped at 512, replies to other commands at 64 MB, and only the end of
@@ -172,9 +193,20 @@ setting is saved in `~/.config/tailfiles/hosts.json`. Settings in
   folder or the other way round.
 - Rename uses the same atomic no-replace rename, here and on Linux and
   macOS machines.
-- Windows: SFTP can't hold a folder open or rename without a chance of
-  replacing something, and Windows has no shell to do it for us, so copying
-  to or from a Windows machine and renaming on it are refused.
+- On Windows the helper does the same with NT handles: every item is
+  opened relative to a held folder handle (`NtCreateFile` with a root
+  directory) without following junctions or symlinks, which are left out of
+  copies like Linux symlinks are, and counted. It is renamed into place by
+  handle (`NtSetInformationFile`, refusing to replace anything unless you
+  chose Replace). New items are created under hidden temporary names
+  (`.tailfiles-incoming-…`) in the folder they belong in and removed through
+  their handles if the copy fails or is cancelled. Windows treats names as
+  case-insensitive, so the existing-name check and the placement both do,
+  and a replaced file keeps its existing name's spelling. Names Windows
+  can't hold (`\ / : * ? " < > |`, a trailing dot or space, `CON`, `NUL`
+  and the other reserved names) are refused before anything is written, as
+  are two names in one folder that differ only in case. Read-only files
+  arrive read-only, and dates are kept both ways.
 - The account is fixed per machine for a whole run, so both sides of a copy
   between two panes on one machine must use the same account; the window
   and the helper refuse otherwise.
@@ -198,9 +230,14 @@ setting is saved in `~/.config/tailfiles/hosts.json`. Settings in
   NUL-separated over stdin to one fixed remote script, which enters each
   parent folder physically, checks the real location against the account's
   home again, and removes the item relative to that folder, so nothing can
-  redirect it between the check and the delete. On Windows it walks the
-  folder over SFTP and builds every command before running any. A selected
-  symlink is removed itself, never its target.
+  redirect it between the check and the delete. On Windows (where SFTP
+  lists a junction or directory symlink as an ordinary folder) the helper
+  opens each item by handle, checks its real path against the profile
+  folder for every item before deleting any, and removes a junction or
+  symlink as the link itself, never descending into it. A
+  selected symlink is removed itself, never its target.
+- `sftp` runs under a UTF-8 locale, so accented and other non-ASCII names
+  are listed and used exactly.
 - Every reply from `sftp` must have the exact shape of the commands sent
   (each command echoed, `cd` silent, `pwd` one line). A folder or file name
   containing a line break breaks that shape, so the action stops instead of
